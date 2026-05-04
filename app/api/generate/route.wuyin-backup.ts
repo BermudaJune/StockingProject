@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 
 const DEFAULT_SUBMIT_URL = "https://api.wuyinkeji.com/api/async/image_gpt";
 const DEFAULT_DETAIL_URL = "https://api.wuyinkeji.com/api/async/detail";
-const DEFAULT_OYY_BASE_URL = "https://www.oyy-ai.com";
 
 type SubmitApiResponse = {
   code: number;
@@ -24,20 +23,6 @@ type DetailApiResponse = {
   } | null;
 };
 
-type OyyImageResponse = {
-  created?: number;
-  data?: Array<{
-    b64_json?: string;
-    url?: string;
-    revised_prompt?: string;
-  }>;
-  error?: {
-    message?: string;
-    type?: string;
-    code?: string;
-  };
-};
-
 type ParsedUpstreamResponse<T> = {
   ok: boolean;
   status: number;
@@ -47,14 +32,51 @@ type ParsedUpstreamResponse<T> = {
 
 export async function POST(request: Request) {
   try {
-    const provider = getProvider();
+    const apiKey = getApiKey();
     const formData = await request.formData();
-    const prompt = readRequiredField(formData, "prompt");
 
-    if (provider === "oyy") {
-      return await handleOyyPost(formData, prompt);
+    const prompt = readRequiredField(formData, "prompt");
+    const aspectRatio = readOptionalField(formData, "aspectRatio") || "auto";
+    const submitUrl = process.env.WUYIN_IMAGE_API_URL?.trim() || DEFAULT_SUBMIT_URL;
+    const urls = await extractImageUrlsFromFormData(formData);
+
+    const submitJson = await submitTaskWithRetry({
+      submitUrl,
+      apiKey,
+      prompt,
+      aspectRatio,
+      urls
+    });
+
+    const submitData = submitJson.data;
+    if (!submitData?.id) {
+      throw new Error(`提交失败：${submitJson.msg || "未返回任务ID"}`);
     }
-    return await handleWuyinPost(formData, prompt);
+
+    const taskId = submitData.id;
+    const detailJson = await waitForTaskResult(taskId, apiKey);
+    const status = typeof detailJson?.data?.status === "number" ? detailJson.data.status : 0;
+    const imageUrl = detailJson?.data?.result?.[0] || null;
+    const detailMessage = detailJson?.data?.message?.trim() || detailJson?.msg || "";
+
+    if (status === 3) {
+      return NextResponse.json(
+        {
+          error: detailMessage || "任务失败（触发平台策略）",
+          taskId,
+          status
+        },
+        { status: 400 }
+      );
+    }
+
+    return NextResponse.json({
+      taskId,
+      count: submitData.count ?? detailJson?.data?.count ?? 1,
+      status,
+      imageUrl,
+      message: imageUrl ? "生成完成" : detailMessage || "任务已提交，仍在处理中"
+    });
   } catch (error) {
     return NextResponse.json({ error: toErrorMessage(error) }, { status: 400 });
   }
@@ -62,15 +84,7 @@ export async function POST(request: Request) {
 
 export async function GET(request: Request) {
   try {
-    const provider = getProvider();
-    if (provider === "oyy") {
-      return NextResponse.json({
-        status: 2,
-        message: "OYY 接口为同步返回，请直接查看 POST 返回的图片结果。"
-      });
-    }
-
-    const apiKey = getWuyinApiKey();
+    const apiKey = getApiKey();
     const { searchParams } = new URL(request.url);
     const taskId = searchParams.get("taskId")?.trim();
     if (!taskId) {
@@ -91,172 +105,6 @@ export async function GET(request: Request) {
   } catch (error) {
     return NextResponse.json({ error: toErrorMessage(error) }, { status: 400 });
   }
-}
-
-async function handleWuyinPost(formData: FormData, prompt: string) {
-  const apiKey = getWuyinApiKey();
-  const aspectRatio = readOptionalField(formData, "aspectRatio") || "auto";
-  const submitUrl = process.env.WUYIN_IMAGE_API_URL?.trim() || DEFAULT_SUBMIT_URL;
-  const urls = await extractImageUrlsFromFormData(formData);
-
-  const submitJson = await submitTaskWithRetry({
-    submitUrl,
-    apiKey,
-    prompt,
-    aspectRatio,
-    urls
-  });
-
-  const submitData = submitJson.data;
-  if (!submitData?.id) {
-    throw new Error(`提交失败：${submitJson.msg || "未返回任务ID"}`);
-  }
-
-  const taskId = submitData.id;
-  const detailJson = await waitForTaskResult(taskId, apiKey);
-  const status = typeof detailJson?.data?.status === "number" ? detailJson.data.status : 0;
-  const imageUrl = detailJson?.data?.result?.[0] || null;
-  const detailMessage = detailJson?.data?.message?.trim() || detailJson?.msg || "";
-
-  if (status === 3) {
-    return NextResponse.json(
-      {
-        error: detailMessage || "任务失败（触发平台策略）",
-        taskId,
-        status
-      },
-      { status: 400 }
-    );
-  }
-
-  return NextResponse.json({
-    taskId,
-    count: submitData.count ?? detailJson?.data?.count ?? 1,
-    status,
-    imageUrl,
-    message: imageUrl ? "生成完成" : detailMessage || "任务已提交，仍在处理中"
-  });
-}
-
-async function handleOyyPost(formData: FormData, prompt: string) {
-  const baseUrl = (process.env.OYY_BASE_URL?.trim() || DEFAULT_OYY_BASE_URL).replace(/\/+$/, "");
-  const apiKey = getOyyApiKey();
-  const model = process.env.OYY_MODEL?.trim() || "gpt-image-2";
-  const aspectRatio = readOptionalField(formData, "aspectRatio") || "3:4";
-  const size = mapAspectRatioToOyySize(aspectRatio);
-  const files = getImageFilesFromFormData(formData);
-
-  const responseVariants: OyyRequestImageField[] = ["image[]", "image"];
-  let lastErrorMessage = "OYY 请求失败";
-
-  for (let i = 0; i < responseVariants.length; i++) {
-    const fieldName = responseVariants[i];
-    try {
-      const parsed = await requestOyyEdits({
-        baseUrl,
-        apiKey,
-        model,
-        prompt,
-        size,
-        files,
-        imageFieldName: fieldName
-      });
-
-      const json = parsed.json;
-      if (!json) {
-        throw new Error(buildUpstreamError("OYY 返回解析失败", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
-      }
-
-      const errorMessage = json.error?.message?.trim();
-      if (!parsed.ok || errorMessage) {
-        const friendlyMessage = mapOyyErrorMessage(errorMessage || parsed.raw);
-        throw new Error(
-          buildUpstreamError("OYY 提交失败", {
-            httpStatus: parsed.status,
-            providerMsg: friendlyMessage || errorMessage || "",
-            raw: parsed.raw
-          })
-        );
-      }
-
-      const first = json.data?.[0];
-      const imageUrl = first?.url?.trim() || null;
-      const imageDataUrl = first?.b64_json ? `data:image/png;base64,${first.b64_json}` : null;
-      if (!imageUrl && !imageDataUrl) {
-        throw new Error(
-          buildUpstreamError("OYY 未返回图片", {
-            httpStatus: parsed.status,
-            providerMsg: "",
-            raw: parsed.raw
-          })
-        );
-      }
-
-      return NextResponse.json({
-        status: 2,
-        imageUrl,
-        imageDataUrl,
-        message: "生成完成"
-      });
-    } catch (error) {
-      lastErrorMessage = toErrorMessage(error);
-      if (i === responseVariants.length - 1) {
-        throw new Error(lastErrorMessage);
-      }
-    }
-  }
-  throw new Error(lastErrorMessage);
-}
-
-async function requestOyyEdits(params: {
-  baseUrl: string;
-  apiKey: string;
-  model: string;
-  prompt: string;
-  size: string;
-  files: File[];
-  imageFieldName: OyyRequestImageField;
-}): Promise<ParsedUpstreamResponse<OyyImageResponse>> {
-  const { baseUrl, apiKey, model, prompt, size, files, imageFieldName } = params;
-  const endpoint = `${baseUrl}/v1/images/edits`;
-  const maxAttempts = 3;
-  let lastError = "OYY 请求失败";
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const body = new FormData();
-    body.append("model", model);
-    body.append("prompt", prompt);
-    body.append("size", size);
-    for (const file of files) {
-      body.append(imageFieldName, file, file.name || "image.png");
-    }
-
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`
-        },
-        body,
-        cache: "no-store"
-      });
-
-      const parsed = await parseUpstreamResponse<OyyImageResponse>(response);
-      if (isRetryableOyyStatus(parsed.status) && attempt < maxAttempts) {
-        await sleep(800 * attempt);
-        continue;
-      }
-      return parsed;
-    } catch (error) {
-      lastError = toErrorMessage(error);
-      if (attempt >= maxAttempts) {
-        throw new Error(lastError);
-      }
-      await sleep(800 * attempt);
-    }
-  }
-
-  throw new Error(lastError);
 }
 
 async function submitTaskWithRetry(params: {
@@ -397,18 +245,6 @@ function getApiKey(): string {
   return apiKey;
 }
 
-function getWuyinApiKey(): string {
-  return getApiKey();
-}
-
-function getOyyApiKey(): string {
-  const apiKey = process.env.OYY_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error("缺少 OYY_API_KEY，请在 .env 中配置");
-  }
-  return apiKey;
-}
-
 function readRequiredField(formData: FormData, key: string): string {
   const value = formData.get(key);
   if (typeof value !== "string" || !value.trim()) {
@@ -435,49 +271,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 type UploadFieldKey = "sock" | "shoe" | "outfit" | "background";
-type OyyRequestImageField = "image" | "image[]";
-
-function getImageFilesFromFormData(formData: FormData): File[] {
-  const imageKeys: UploadFieldKey[] = ["sock", "shoe", "outfit", "background"];
-  return imageKeys.map((key) => formData.get(key)).filter((value): value is File => value instanceof File);
-}
-
-function mapAspectRatioToOyySize(aspectRatio: string): string {
-  const normalized = aspectRatio.trim();
-  switch (normalized) {
-    case "1:1":
-      return "1024x1024";
-    case "4:3":
-      return "1536x1024";
-    case "3:4":
-      return "1024x1536";
-    default:
-      return "1024x1536";
-  }
-}
-
-function getProvider(): "wuyin" | "oyy" {
-  const provider = process.env.IMAGE_PROVIDER?.trim().toLowerCase();
-  if (provider === "oyy") {
-    return "oyy";
-  }
-  return "wuyin";
-}
-
-function isRetryableOyyStatus(status: number): boolean {
-  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
-}
-
-function mapOyyErrorMessage(message: string): string {
-  const raw = message.trim();
-  if (!raw) {
-    return "";
-  }
-  if (/moderation_blocked|safety system|safety_violations|sexual/i.test(raw)) {
-    return "内容审核未通过：当前提示词或参考图触发了平台安全策略，请调整提示词与参考图后重试。";
-  }
-  return raw;
-}
 
 async function parseUpstreamResponse<T>(response: Response): Promise<ParsedUpstreamResponse<T>> {
   const raw = await response.text();

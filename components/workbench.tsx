@@ -427,6 +427,13 @@ export function Workbench({ initialTemplates }: Props) {
                 <div className="preview-box">
                   {generatedImageUrl ? <img alt="最新生成结果" src={generatedImageUrl} /> : <div className="preview-placeholder">暂无结果图</div>}
                 </div>
+                {generatedImageUrl ? (
+                  <div style={{ marginTop: 12 }}>
+                    <button className="secondary-button" onClick={() => downloadImageSource(generatedImageUrl, buildResultFileName())}>
+                      下载结果
+                    </button>
+                  </div>
+                ) : null}
               </div>
             </div>
             <div className="section">
@@ -529,11 +536,7 @@ async function saveBatchResult(outputRoot: FileSystemDirectoryHandle, groupName:
   await writeTextFile(groupDir, "result.meta.json", JSON.stringify(meta, null, 2));
 
   try {
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const blob = await response.blob();
+    const blob = await fetchImageBlob(imageUrl);
     await writeBlobFile(groupDir, "result.png", blob);
   } catch {
     await writeTextFile(groupDir, "result.url.txt", imageUrl);
@@ -645,4 +648,56 @@ function toErrorMessage(error: unknown, fallback: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function downloadImageSource(source: string, fileName: string): Promise<void> {
+  const blob = await fetchImageBlob(source);
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = fileName;
+    link.click();
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function fetchImageBlob(source: string): Promise<Blob> {
+  if (source.startsWith("data:")) {
+    return dataUrlToBlob(source);
+  }
+
+  const response = await fetch(`/api/image-proxy?url=${encodeURIComponent(source)}`, { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return await response.blob();
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/.exec(dataUrl);
+  if (!match) {
+    throw new Error("无效的数据图片");
+  }
+
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = !!match[2];
+  const data = match[3] || "";
+
+  if (isBase64) {
+    const binary = atob(data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+  }
+
+  return new Blob([decodeURIComponent(data)], { type: mimeType });
+}
+
+function buildResultFileName(): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `generated-${timestamp}.png`;
 }
