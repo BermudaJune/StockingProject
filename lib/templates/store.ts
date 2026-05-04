@@ -10,7 +10,7 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "prompt-templates.json");
 export async function readTemplateConfig(filePath = CONFIG_FILE): Promise<TemplateConfig> {
   try {
     const raw = await fs.readFile(filePath, "utf8");
-    const parsed = JSON.parse(raw) as Partial<TemplateConfig>;
+    const parsed = JSON.parse(stripUtf8Bom(raw)) as Partial<TemplateConfig>;
 
     if (typeof parsed.mainPrompt !== "string") {
       throw new Error("Invalid template config shape.");
@@ -36,6 +36,10 @@ export async function readTemplateConfig(filePath = CONFIG_FILE): Promise<Templa
     await writeTemplateConfig(defaults, filePath);
     return defaults;
   }
+}
+
+function stripUtf8Bom(input: string): string {
+  return input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
 }
 
 export async function writeTemplateConfig(config: TemplateConfig, filePath = CONFIG_FILE): Promise<TemplateConfig> {
