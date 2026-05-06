@@ -72,6 +72,38 @@ const STRICT_CONSISTENCY_PROMPT = `【强一致性约束（最高优先级，必
 服装必须严格与服装参考图一致：外套/内搭/下装的服装元素、版型轮廓、颜色关系不可改变。
 袜子必须严格与产品参考图一致：脚背是否露出、标签前后位置、纹理细节、开口位置、长度、贴合方式都必须一致。
 禁止任何与参考图不一致的改动；若动作与一致性冲突，优先保证一致性。`;
+const SINGLE_STEP_A_PROMPT = `生成一张女性腿部与脚部的电商展示图。
+
+【参考图分工】
+- 图1：袜子产品图，仅用于袜子外观、纹理、标签位置、镂空结构
+- 图2：鞋子参考图，仅用于鞋型与材质
+
+【严格要求】
+- 仅生成腿部与脚部（大腿中部到脚尖）
+- 袜子必须严格基于图1，标签位置与镂空结构不得改变
+- 鞋子必须严格基于图2，不得替换为其他鞋型
+- 不生成服装
+- 不生成背景或场景
+- 姿态自然，符合真实模特拍摄逻辑
+
+输出：单张图像`;
+const SINGLE_STEP_B_PROMPT = `基于上一张图片进行编辑。
+
+【绝对锁定】
+- 上一张图中的腿部、袜子、鞋子必须完全保持不变
+- 不得重绘、不得修改袜子或鞋子
+
+【参考图分工】
+- 图2：服装参考图，仅用于服装款式与配色
+- 图3：背景参考图，仅用于空间结构、地面/墙面关系、主光方向
+
+【生成要求】
+- 添加自然站立的全身模特形象，要时尚有魅力，最大程度吸取服装和背景参考图的高级感
+- 服装弱化处理，不得遮挡袜子主体
+- 背景与光影严格基于背景参考图
+- 构图为竖图，3:4，电商穿搭风格
+
+输出：单张全身主图`;
 const VARIANT_ACTION_PROMPTS: Record<number, string> = {
   1: `第 1 张【全身主图・标准正面】
 构图：全身竖幅，正面站立，居中对称
@@ -164,7 +196,7 @@ export function Workbench({ initialTemplates }: Props) {
       const directoryHandle = await pickDirectory("single-input", "readwrite");
       const granted = await ensureDirectoryPermission(directoryHandle, "readwrite");
       if (!granted) {
-        throw new Error("未获得单组输入目录写入权限，无法回写 result_0 到 result_5");
+        throw new Error("未获得单组输入目录写入权限，无法回写 result_A 与 result_0 到 result_5");
       }
       setSingleInputDirectory({ name: directoryHandle.name, handle: directoryHandle });
     } catch (error) {
@@ -202,53 +234,87 @@ export function Workbench({ initialTemplates }: Props) {
     setErrorMessage("");
     setStatusMessage("");
     if (!singleInputDirectory) {
-      setErrorMessage("单组模式请先选择“单组输入目录”，系统会从该目录读取输入图并回写 result_0 到 result_5");
+      setErrorMessage("单组模式请先选择“单组输入目录”，系统会从该目录读取输入图并回写 result_A 与 result_0 到 result_5");
       return;
     }
 
     const runAbortController = createRunAbortController();
     setIsGenerating(true);
     try {
-      const stepOnePrompt = buildStepOnePrompt(template.mainPrompt, template.stepOnePrompt);
+      const stepAPrompt = buildSingleStepAPrompt(template.stepOnePrompt);
+      const stepBPrompt = buildSingleStepBPrompt(template.mainPrompt);
       const stepTwoPrompt = buildStepTwoPrompt(template.stepTwoPrompt);
-      const referenceFiles = await readBatchGroupInput(singleInputDirectory.handle);
-      const expectedFiles = ["result_0.png", "result_1.png", "result_2.png", "result_3.png", "result_4.png", "result_5.png"];
+      const [productFile, shoeFile, outfitFile, backgroundFile] = await readBatchGroupInput(singleInputDirectory.handle);
+      const expectedFiles = ["result_A.png", "result_0.png", "result_1.png", "result_2.png", "result_3.png", "result_4.png", "result_5.png"];
 
       if (continueFromExisting) {
         const missing = await listMissingResultFiles(singleInputDirectory.handle, expectedFiles);
         if (missing.length === 0) {
-          setStatusMessage("单组目录已存在 result_0 到 result_5，已跳过。");
+          setStatusMessage("单组目录已存在 result_A 到 result_5，已跳过。");
           return;
         }
       }
 
-      let stepOneBlob: Blob;
-      const hasResult0 = continueFromExisting && (await fileExists(singleInputDirectory.handle, "result_0.png"));
-      if (hasResult0) {
-        stepOneBlob = await readBlobFile(singleInputDirectory.handle, "result_0.png");
-        setStatusMessage("单组第1步：检测到已存在 result_0.png，跳过重生。");
+      let stepABlob: Blob;
+      const hasResultA = continueFromExisting && (await fileExists(singleInputDirectory.handle, "result_A.png"));
+      if (hasResultA) {
+        stepABlob = await readBlobFile(singleInputDirectory.handle, "result_A.png");
+        setStatusMessage("单组第A步：检测到已存在 result_A.png，跳过重生。");
       } else {
-        setStatusMessage("单组第1步：正在生成 result_0...");
-        const stepOneSource = await generateImageWithPerImageRetry({
+        setStatusMessage("单组第A步：正在生成 result_A...");
+        const stepASource = await generateImageWithPerImageRetry({
           createFormData: () =>
-            buildImageGenerationFormData({
-              prompt: stepOnePrompt,
-              aspectRatio: BATCH_ASPECT_RATIO,
+            buildImageGenerationFormDataByRole({
+              prompt: stepAPrompt,
+              aspectRatio,
               outputSize,
-              files: referenceFiles
-          }),
-          onProgress: (message) => setStatusMessage(`单组第1步：${message}`),
-          taskLabel: "单组第1步 result_0",
+              sock: productFile,
+              shoe: shoeFile,
+              skipPromptGuard: true
+            }),
+          onProgress: (message) => setStatusMessage(`单组第A步：${message}`),
+          taskLabel: "单组第A步 result_A",
           signal: runAbortController.signal
         });
-        setGeneratedImageUrl(stepOneSource);
+        setGeneratedImageUrl(stepASource);
 
         throwIfStopRequested();
-        stepOneBlob = await fetchImageBlob(stepOneSource, runAbortController.signal);
-        await writeBlobFile(singleInputDirectory.handle, "result_0.png", stepOneBlob);
-        setStatusMessage("单组第1步：已写入 result_0.png");
+        stepABlob = await fetchImageBlob(stepASource, runAbortController.signal);
+        await writeBlobFile(singleInputDirectory.handle, "result_A.png", stepABlob);
+        setStatusMessage("单组第A步：已写入 result_A.png");
       }
-      const result0File = new File([stepOneBlob], "result_0.png", { type: stepOneBlob.type || "image/png" });
+      const resultAFile = new File([stepABlob], "result_A.png", { type: stepABlob.type || "image/png" });
+
+      let stepBBlob: Blob;
+      const hasResult0 = continueFromExisting && (await fileExists(singleInputDirectory.handle, "result_0.png"));
+      if (hasResult0) {
+        stepBBlob = await readBlobFile(singleInputDirectory.handle, "result_0.png");
+        setStatusMessage("单组第B步：检测到已存在 result_0.png，跳过重生。");
+      } else {
+        setStatusMessage("单组第B步：正在生成 result_0...");
+        const stepBSource = await generateImageWithPerImageRetry({
+          createFormData: () =>
+            buildImageGenerationFormDataByRole({
+              prompt: stepBPrompt,
+              aspectRatio: BATCH_ASPECT_RATIO,
+              outputSize,
+              sock: resultAFile,
+              outfit: outfitFile,
+              background: backgroundFile,
+              skipPromptGuard: true
+            }),
+          onProgress: (message) => setStatusMessage(`单组第B步：${message}`),
+          taskLabel: "单组第B步 result_0",
+          signal: runAbortController.signal
+        });
+        setGeneratedImageUrl(stepBSource);
+
+        throwIfStopRequested();
+        stepBBlob = await fetchImageBlob(stepBSource, runAbortController.signal);
+        await writeBlobFile(singleInputDirectory.handle, "result_0.png", stepBBlob);
+        setStatusMessage("单组第B步：已写入 result_0.png");
+      }
+      const result0File = new File([stepBBlob], "result_0.png", { type: stepBBlob.type || "image/png" });
 
       let latestVariantSource = generatedImageUrl;
       for (let variantIndex = 1; variantIndex <= BATCH_VARIANT_COUNT; variantIndex++) {
@@ -258,7 +324,7 @@ export function Workbench({ initialTemplates }: Props) {
         }
 
         throwIfStopRequested();
-        setStatusMessage(`单组第2步：正在生成 result_${variantIndex}...`);
+        setStatusMessage(`单组第C步：正在生成 result_${variantIndex}...`);
         const variantSource = await generateImageWithPerImageRetry({
           createFormData: () =>
             buildImageGenerationFormData({
@@ -267,14 +333,14 @@ export function Workbench({ initialTemplates }: Props) {
               outputSize,
               files: [result0File]
             }),
-          onProgress: (message) => setStatusMessage(`单组第2步 result_${variantIndex}：${message}`),
-          taskLabel: `单组第2步 result_${variantIndex}`,
+          onProgress: (message) => setStatusMessage(`单组第C步 result_${variantIndex}：${message}`),
+          taskLabel: `单组第C步 result_${variantIndex}`,
           signal: runAbortController.signal
         });
         const variantBlob = await fetchImageBlob(variantSource, runAbortController.signal);
         if (singleInputDirectory) {
           await writeBlobFile(singleInputDirectory.handle, `result_${variantIndex}.png`, variantBlob);
-          setStatusMessage(`单组第2步：已写入 result_${variantIndex}.png`);
+          setStatusMessage(`单组第C步：已写入 result_${variantIndex}.png`);
         }
         latestVariantSource = variantSource;
         setGeneratedImageUrl(variantSource);
@@ -287,7 +353,7 @@ export function Workbench({ initialTemplates }: Props) {
         setGeneratedImageUrl(latestVariantSource);
       }
       setStatusMessage(
-        "单组两步流程完成，已写入该输入目录：result_0.png 到 result_5.png。"
+        "单组三步流程完成，已写入该输入目录：result_A.png 与 result_0.png 到 result_5.png。"
       );
     } catch (error) {
       if (isAbortLikeError(error)) {
@@ -621,7 +687,7 @@ export function Workbench({ initialTemplates }: Props) {
               <div className="section-header">
                 <div>
                   <h2>单组输入</h2>
-                  <p>单组生成会从“单组输入目录”读取图片并回写 result_0 到 result_5。上传区仅用于预览与对照。</p>
+                  <p>单组生成会从“单组输入目录”读取图片并回写 result_A 与 result_0 到 result_5。上传区仅用于预览与对照。</p>
                 </div>
               </div>
 
@@ -784,6 +850,22 @@ function buildStepOnePrompt(mainPrompt: string, stepOnePrompt: string): string {
   return `${base}\n\n${tweak}`;
 }
 
+function buildSingleStepAPrompt(stepOnePrompt: string): string {
+  const tweak = stepOnePrompt.trim();
+  if (!tweak) {
+    return SINGLE_STEP_A_PROMPT;
+  }
+  return `${SINGLE_STEP_A_PROMPT}\n\n${tweak}`;
+}
+
+function buildSingleStepBPrompt(mainPrompt: string): string {
+  const tweak = mainPrompt.trim();
+  if (!tweak) {
+    return SINGLE_STEP_B_PROMPT;
+  }
+  return `${SINGLE_STEP_B_PROMPT}\n\n${tweak}`;
+}
+
 function buildImageGenerationFormData(params: {
   prompt: string;
   aspectRatio: MainAspectRatio;
@@ -809,6 +891,38 @@ function buildImageGenerationFormData(params: {
   }
 
   throw new Error(`不支持的输入图片数量：${params.files.length}`);
+}
+
+function buildImageGenerationFormDataByRole(params: {
+  prompt: string;
+  aspectRatio: MainAspectRatio;
+  outputSize: OutputSize;
+  sock?: File;
+  shoe?: File;
+  outfit?: File;
+  background?: File;
+  skipPromptGuard?: boolean;
+}): FormData {
+  const formData = new FormData();
+  formData.append("prompt", params.skipPromptGuard ? params.prompt : buildPromptWithProductLock(params.prompt));
+  formData.append("aspectRatio", params.aspectRatio);
+  formData.append("outputSize", params.outputSize);
+  if (params.sock) {
+    formData.append("sock", params.sock);
+  }
+  if (params.shoe) {
+    formData.append("shoe", params.shoe);
+  }
+  if (params.outfit) {
+    formData.append("outfit", params.outfit);
+  }
+  if (params.background) {
+    formData.append("background", params.background);
+  }
+  if (!params.sock && !params.shoe && !params.outfit && !params.background) {
+    throw new Error("未提供参考图");
+  }
+  return formData;
 }
 
 function buildPromptWithProductLock(prompt: string): string {
