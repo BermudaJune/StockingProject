@@ -30,6 +30,10 @@ export async function readTemplateConfig(filePath = CONFIG_FILE): Promise<Templa
         typeof parsed.stepOnePrompt === "string" && parsed.stepOnePrompt.trim()
           ? normalizePrompt(parsed.stepOnePrompt)
           : defaults.stepOnePrompt,
+      stepThreePrompt:
+        typeof parsed.stepThreePrompt === "string" && parsed.stepThreePrompt.trim()
+          ? normalizePrompt(parsed.stepThreePrompt)
+          : defaults.stepThreePrompt,
       stepTwoPrompt:
         typeof parsed.stepTwoPrompt === "string" && parsed.stepTwoPrompt.trim()
           ? normalizePrompt(parsed.stepTwoPrompt)
@@ -57,6 +61,7 @@ export async function writeTemplateConfig(config: TemplateConfig, filePath = CON
   const normalized: TemplateConfig = {
     mainPrompt: normalizePrompt(config.mainPrompt),
     stepOnePrompt: normalizePrompt(config.stepOnePrompt),
+    stepThreePrompt: normalizePrompt(config.stepThreePrompt),
     stepTwoPrompt: normalizePrompt(config.stepTwoPrompt),
     updatedAt: new Date().toISOString()
   };

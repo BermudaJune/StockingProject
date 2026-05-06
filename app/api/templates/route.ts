@@ -40,6 +40,9 @@ function validateTemplatePayload(payload: Partial<TemplateConfig>): TemplateConf
   if (typeof payload.stepOnePrompt !== "string") {
     throw new Error("模板数据结构不合法。");
   }
+  if (typeof payload.stepThreePrompt !== "string") {
+    throw new Error("模板数据结构不合法。");
+  }
   if (typeof payload.stepTwoPrompt !== "string") {
     throw new Error("模板数据结构不合法。");
   }
@@ -47,6 +50,7 @@ function validateTemplatePayload(payload: Partial<TemplateConfig>): TemplateConf
   return {
     mainPrompt: payload.mainPrompt,
     stepOnePrompt: payload.stepOnePrompt,
+    stepThreePrompt: payload.stepThreePrompt,
     stepTwoPrompt: payload.stepTwoPrompt,
     updatedAt: new Date().toISOString()
   };
