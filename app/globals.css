@@ -195,6 +195,11 @@ button {
   object-fit: cover;
 }
 
+.preview-box.preview-full img {
+  object-fit: contain;
+  background: rgba(255, 255, 255, 0.78);
+}
+
 .preview-placeholder {
   display: grid;
   place-items: center;

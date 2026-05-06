@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 const DEFAULT_SUBMIT_URL = "https://api.wuyinkeji.com/api/async/image_gpt";
 const DEFAULT_DETAIL_URL = "https://api.wuyinkeji.com/api/async/detail";
 const DEFAULT_OYY_BASE_URL = "https://www.oyy-ai.com";
+const DEFAULT_OYY_IMAGE_API_PATH = "/v1/images/edits";
+const DEFAULT_OYY_SOFT_TIMEOUT_MS = 10 * 60 * 1000;
 
 type SubmitApiResponse = {
   code: number;
@@ -52,7 +54,7 @@ export async function POST(request: Request) {
     const prompt = readRequiredField(formData, "prompt");
 
     if (provider === "oyy") {
-      return await handleOyyPost(formData, prompt);
+      return await handleOyyPost(formData, prompt, request.signal);
     }
     return await handleWuyinPost(formData, prompt);
   } catch (error) {
@@ -138,17 +140,62 @@ async function handleWuyinPost(formData: FormData, prompt: string) {
   });
 }
 
-async function handleOyyPost(formData: FormData, prompt: string) {
+async function handleOyyPost(formData: FormData, prompt: string, signal?: AbortSignal) {
   const baseUrl = (process.env.OYY_BASE_URL?.trim() || DEFAULT_OYY_BASE_URL).replace(/\/+$/, "");
   const apiKey = getOyyApiKey();
   const model = process.env.OYY_MODEL?.trim() || "gpt-image-2";
+  const imageApiPath = normalizeOyyImageApiPath(process.env.OYY_IMAGE_API_PATH?.trim() || DEFAULT_OYY_IMAGE_API_PATH);
   const aspectRatio = readOptionalField(formData, "aspectRatio") || "3:4";
   const size = mapAspectRatioToOyySize(aspectRatio);
   const files = getImageFilesFromFormData(formData);
+  const useGenerations = imageApiPath === "/v1/images/generations";
 
-  const responseVariants: OyyRequestImageField[] = ["image[]", "image"];
   let lastErrorMessage = "OYY 请求失败";
 
+  if (useGenerations) {
+    const parsed = await requestOyyGenerations({
+      baseUrl,
+      apiKey,
+      model,
+      prompt,
+      size,
+      signal
+    });
+    const json = parsed.json;
+    if (!json) {
+      throw new Error(buildUpstreamError("OYY 返回解析失败", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
+    }
+    const errorMessage = json.error?.message?.trim();
+    if (!parsed.ok || errorMessage) {
+      throw new Error(
+        buildUpstreamError("OYY 提交失败", {
+          httpStatus: parsed.status,
+          providerMsg: errorMessage || "",
+          raw: parsed.raw
+        })
+      );
+    }
+    const first = json.data?.[0];
+    const imageUrl = first?.url?.trim() || null;
+    const imageDataUrl = first?.b64_json ? `data:image/png;base64,${first.b64_json}` : null;
+    if (!imageUrl && !imageDataUrl) {
+      throw new Error(
+        buildUpstreamError("OYY 未返回图片", {
+          httpStatus: parsed.status,
+          providerMsg: "",
+          raw: parsed.raw
+        })
+      );
+    }
+    return NextResponse.json({
+      status: 2,
+      imageUrl,
+      imageDataUrl,
+      message: "生成完成"
+    });
+  }
+
+  const responseVariants: OyyRequestImageField[] = ["image[]", "image"];
   for (let i = 0; i < responseVariants.length; i++) {
     const fieldName = responseVariants[i];
     try {
@@ -159,9 +206,10 @@ async function handleOyyPost(formData: FormData, prompt: string) {
         prompt,
         size,
         files,
-        imageFieldName: fieldName
+        imageFieldName: fieldName,
+        imageApiPath,
+        signal
       });
-
       const json = parsed.json;
       if (!json) {
         throw new Error(buildUpstreamError("OYY 返回解析失败", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
@@ -169,11 +217,10 @@ async function handleOyyPost(formData: FormData, prompt: string) {
 
       const errorMessage = json.error?.message?.trim();
       if (!parsed.ok || errorMessage) {
-        const friendlyMessage = mapOyyErrorMessage(errorMessage || parsed.raw);
         throw new Error(
           buildUpstreamError("OYY 提交失败", {
             httpStatus: parsed.status,
-            providerMsg: friendlyMessage || errorMessage || "",
+            providerMsg: errorMessage || "",
             raw: parsed.raw
           })
         );
@@ -216,11 +263,14 @@ async function requestOyyEdits(params: {
   size: string;
   files: File[];
   imageFieldName: OyyRequestImageField;
+  imageApiPath: string;
+  signal?: AbortSignal;
 }): Promise<ParsedUpstreamResponse<OyyImageResponse>> {
-  const { baseUrl, apiKey, model, prompt, size, files, imageFieldName } = params;
-  const endpoint = `${baseUrl}/v1/images/edits`;
+  const { baseUrl, apiKey, model, prompt, size, files, imageFieldName, imageApiPath, signal } = params;
+  const endpoint = `${baseUrl}${imageApiPath}`;
   const maxAttempts = 3;
   let lastError = "OYY 请求失败";
+  const timeoutMs = getOyySoftTimeoutMs();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const body = new FormData();
@@ -232,22 +282,89 @@ async function requestOyyEdits(params: {
     }
 
     try {
-      const response = await fetch(endpoint, {
+      const response = await fetchWithSoftTimeout(endpoint, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`
         },
         body,
-        cache: "no-store"
-      });
+        cache: "no-store",
+        signal
+      }, timeoutMs);
 
       const parsed = await parseUpstreamResponse<OyyImageResponse>(response);
+      if (isModerationBlockedOyyResponse(parsed)) {
+        return parsed;
+      }
       if (isRetryableOyyStatus(parsed.status) && attempt < maxAttempts) {
         await sleep(800 * attempt);
         continue;
       }
       return parsed;
     } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
+      lastError = toErrorMessage(error);
+      if (attempt >= maxAttempts) {
+        throw new Error(lastError);
+      }
+      await sleep(800 * attempt);
+    }
+  }
+
+  throw new Error(lastError);
+}
+
+async function requestOyyGenerations(params: {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  prompt: string;
+  size: string;
+  signal?: AbortSignal;
+}): Promise<ParsedUpstreamResponse<OyyImageResponse>> {
+  const { baseUrl, apiKey, model, prompt, size, signal } = params;
+  const endpoint = `${baseUrl}/v1/images/generations`;
+  const maxAttempts = 3;
+  let lastError = "OYY 请求失败";
+  const timeoutMs = getOyySoftTimeoutMs();
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetchWithSoftTimeout(
+        endpoint,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            model,
+            prompt,
+            size,
+            n: 1
+          }),
+          cache: "no-store",
+          signal
+        },
+        timeoutMs
+      );
+
+      const parsed = await parseUpstreamResponse<OyyImageResponse>(response);
+      if (isModerationBlockedOyyResponse(parsed)) {
+        return parsed;
+      }
+      if (isRetryableOyyStatus(parsed.status) && attempt < maxAttempts) {
+        await sleep(800 * attempt);
+        continue;
+      }
+      return parsed;
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
       lastError = toErrorMessage(error);
       if (attempt >= maxAttempts) {
         throw new Error(lastError);
@@ -301,8 +418,7 @@ async function submitTaskWithRetry(params: {
       });
       const canRetry = /500|转发请求失败|目标服务器返回|timeout/i.test(lastError);
       if (!canRetry || attempt === maxAttempts) {
-        const hint = /500|转发请求失败|目标服务器返回/i.test(lastError) ? "这是上游生图服务返回的 500（本地鉴权已通过），建议稍后重试或更换参考图。" : "";
-        throw new Error(`${lastError}${hint ? ` ${hint}` : ""}`);
+        throw new Error(lastError);
       }
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("提交失败")) {
@@ -312,8 +428,7 @@ async function submitTaskWithRetry(params: {
       lastError = error instanceof Error ? error.message : String(error);
       const canRetry = /500|转发请求失败|目标服务器返回|timeout|network|fetch failed/i.test(lastError);
       if (!canRetry || attempt === maxAttempts) {
-        const hint = /500|转发请求失败|目标服务器返回/i.test(lastError) ? "这是上游生图服务返回的 500（本地鉴权已通过），建议稍后重试或更换参考图。" : "";
-        throw new Error(`提交失败：${lastError}${hint ? ` ${hint}` : ""}`);
+        throw new Error(`提交失败：${lastError}`);
       }
     }
 
@@ -357,8 +472,7 @@ async function waitForTaskResult(taskId: string, apiKey: string): Promise<Detail
 }
 
 async function extractImageUrlsFromFormData(formData: FormData): Promise<string[]> {
-  const imageKeys: UploadFieldKey[] = ["sock", "shoe", "outfit", "background"];
-  const files = imageKeys.map((key) => formData.get(key)).filter((value): value is File => value instanceof File);
+  const files = collectImageFilesFromFormData(formData);
 
   return await Promise.all(
     files.map(async (file) => {
@@ -434,12 +548,68 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchWithSoftTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const timeoutController = new AbortController();
+  const externalSignal = init.signal;
+  const hasSoftTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  let softTimedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let detachExternal: (() => void) | null = null;
+
+  if (hasSoftTimeout) {
+    timer = setTimeout(() => {
+      softTimedOut = true;
+      timeoutController.abort();
+    }, timeoutMs);
+  }
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      timeoutController.abort();
+    } else {
+      const onAbort = () => timeoutController.abort();
+      externalSignal.addEventListener("abort", onAbort, { once: true });
+      detachExternal = () => externalSignal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  try {
+    return await fetch(input, { ...init, signal: timeoutController.signal });
+  } catch (error) {
+    if (softTimedOut) {
+      throw new Error(`上游请求超时（>${Math.round(timeoutMs / 1000)}秒，软超时）`);
+    }
+    throw error;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    detachExternal?.();
+  }
+}
+
 type UploadFieldKey = "sock" | "shoe" | "outfit" | "background";
 type OyyRequestImageField = "image" | "image[]";
 
 function getImageFilesFromFormData(formData: FormData): File[] {
-  const imageKeys: UploadFieldKey[] = ["sock", "shoe", "outfit", "background"];
-  return imageKeys.map((key) => formData.get(key)).filter((value): value is File => value instanceof File);
+  return collectImageFilesFromFormData(formData);
+}
+
+function collectImageFilesFromFormData(formData: FormData): File[] {
+  const orderedKeys: Array<UploadFieldKey | "anchor"> = ["sock", "shoe", "outfit", "background", "anchor"];
+  const fromOrdered = orderedKeys.map((key) => formData.get(key)).filter((value): value is File => value instanceof File);
+  const fromExtras: File[] = [];
+
+  for (const [key, value] of formData.entries()) {
+    if (orderedKeys.includes(key as UploadFieldKey | "anchor")) {
+      continue;
+    }
+    if (value instanceof File && value.size > 0 && value.type.startsWith("image/")) {
+      fromExtras.push(value);
+    }
+  }
+
+  return [...fromOrdered, ...fromExtras];
 }
 
 function mapAspectRatioToOyySize(aspectRatio: string): string {
@@ -468,15 +638,30 @@ function isRetryableOyyStatus(status: number): boolean {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
-function mapOyyErrorMessage(message: string): string {
-  const raw = message.trim();
-  if (!raw) {
-    return "";
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function getOyySoftTimeoutMs(): number {
+  const configured = Number.parseInt(process.env.OYY_SOFT_TIMEOUT_MS || "", 10);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
   }
-  if (/moderation_blocked|safety system|safety_violations|sexual/i.test(raw)) {
-    return "内容审核未通过：当前提示词或参考图触发了平台安全策略，请调整提示词与参考图后重试。";
+  return DEFAULT_OYY_SOFT_TIMEOUT_MS;
+}
+
+function normalizeOyyImageApiPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    return DEFAULT_OYY_IMAGE_API_PATH;
   }
-  return raw;
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+}
+
+function isModerationBlockedOyyResponse(parsed: ParsedUpstreamResponse<OyyImageResponse>): boolean {
+  const providerMessage = parsed.json?.error?.message?.trim() || parsed.raw;
+  return /moderation_blocked|safety system|safety_violations|sexual/i.test(providerMessage);
 }
 
 async function parseUpstreamResponse<T>(response: Response): Promise<ParsedUpstreamResponse<T>> {
@@ -491,7 +676,7 @@ async function parseUpstreamResponse<T>(response: Response): Promise<ParsedUpstr
   return {
     ok: response.ok,
     status: response.status,
-    raw: limitRaw(raw),
+    raw,
     json
   };
 }
@@ -513,13 +698,4 @@ function buildUpstreamError(
     pieces.push(`raw=${raw.trim()}`);
   }
   return pieces.join(" | ");
-}
-
-function limitRaw(raw: string): string {
-  const maxLength = 1500;
-  const normalized = raw.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
-  }
-  return `${normalized.slice(0, maxLength)}...(truncated)`;
 }

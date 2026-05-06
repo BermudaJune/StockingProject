@@ -16,15 +16,24 @@ export async function readTemplateConfig(filePath = CONFIG_FILE): Promise<Templa
       throw new Error("Invalid template config shape.");
     }
 
+    const defaults = getDefaultTemplates();
+
     const mainPrompt = normalizePrompt(parsed.mainPrompt);
     if (looksLikeCorruptedPrompt(mainPrompt)) {
-      const defaults = getDefaultTemplates();
       await writeTemplateConfig(defaults, filePath);
       return defaults;
     }
 
     return {
       mainPrompt,
+      stepOnePrompt:
+        typeof parsed.stepOnePrompt === "string" && parsed.stepOnePrompt.trim()
+          ? normalizePrompt(parsed.stepOnePrompt)
+          : defaults.stepOnePrompt,
+      stepTwoPrompt:
+        typeof parsed.stepTwoPrompt === "string" && parsed.stepTwoPrompt.trim()
+          ? normalizePrompt(parsed.stepTwoPrompt)
+          : defaults.stepTwoPrompt,
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString()
     };
   } catch (error) {
@@ -47,6 +56,8 @@ export async function writeTemplateConfig(config: TemplateConfig, filePath = CON
 
   const normalized: TemplateConfig = {
     mainPrompt: normalizePrompt(config.mainPrompt),
+    stepOnePrompt: normalizePrompt(config.stepOnePrompt),
+    stepTwoPrompt: normalizePrompt(config.stepTwoPrompt),
     updatedAt: new Date().toISOString()
   };
 

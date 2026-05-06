@@ -1,8 +1,8 @@
-"use client";
+﻿"use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import { MAIN_ASPECT_RATIOS, type MainAspectRatio } from "@/lib/aspect-ratios";
+import { MAIN_ASPECT_RATIOS, VARIANT_ASPECT_RATIO, type MainAspectRatio } from "@/lib/aspect-ratios";
 import { OUTPUT_SIZES, type OutputSize } from "@/lib/output-sizes";
 import type { TemplateConfig } from "@/lib/templates/types";
 
@@ -57,6 +57,43 @@ const UPLOAD_SLOTS: Array<Omit<UploadSlot, "file">> = [
   }
 ];
 
+const BATCH_ASPECT_RATIO: MainAspectRatio = VARIANT_ASPECT_RATIO;
+const BATCH_VARIANT_COUNT = 5;
+const THROTTLE_BETWEEN_IMAGES_MS = 1500;
+const THROTTLE_BETWEEN_GROUPS_MS = 3500;
+const DEFAULT_IMAGE_RETRY_LIMIT = 2;
+const MANUAL_STOP_MESSAGE = "任务已手动停止";
+const PRODUCT_LOCK_PROMPT = `【产品硬约束（必须执行）】
+输入产品图中的袜子是唯一标准，禁止任何改款、改色、改材质、改纹理、改长度、改版型。
+必须100%保持与输入产品一致，不得新增装饰、logo、图案或结构变化。`;
+const STRICT_CONSISTENCY_PROMPT = `【强一致性约束（最高优先级，必须执行）】
+背景必须严格与背景参考图一致：空间版面、机位高度、透视关系、明暗分区、光影方向、墙地比例都不可改变。
+鞋子必须严格与鞋子参考图一致：款式、鞋头形状、鞋跟高度、材质反光、配色与细节不可改变。
+服装必须严格与服装参考图一致：外套/内搭/下装的服装元素、版型轮廓、颜色关系不可改变。
+袜子必须严格与产品参考图一致：脚背是否露出、标签前后位置、纹理细节、开口位置、长度、贴合方式都必须一致。
+禁止任何与参考图不一致的改动；若动作与一致性冲突，优先保证一致性。`;
+const VARIANT_ACTION_PROMPTS: Record<number, string> = {
+  1: `第 1 张【全身主图・标准正面】
+构图：全身竖幅，正面站立，居中对称
+姿势：自然直立，双脚与肩同宽，体态舒展
+重点：完整展示整体穿搭与袜子主体，品牌视觉核心主图`,
+  2: `第 2 张【全身主图・动态侧姿】
+构图：全身竖幅
+姿势：身体侧转 30°–45°，重心稳定，轻微迈步 / 摆臂动态
+重点：展示侧面版型与穿着立体感，提升点击动态感`,
+  3: `第 3 张【细节图 1・大腿至脚近景】
+构图：近景，仅拍摄大腿到脚部
+禁止：完整上半身入镜
+姿势：侧身站立，腿部自然放松
+重点：突出袜身版型、长度与贴合度`,
+  4: `第 4 张【细节图 2・膝盖以下特写】
+构图：特写，仅拍摄膝盖至脚尖
+姿势：双腿微错开，展示正面 + 侧面纹理
+重点：聚焦袜口、针织纹理、脚踝细节`,
+  5: `第 5 张【细节图 3・局部极致特写】
+低角度仰拍，相机贴地放置，膝盖水平机位，50mm 标准镜头，自然无畸变。模特下半身特写，仅展示大腿到脚部，无完整上半身入镜。模特放松站立，重心单腿支撑，另一条腿微曲前伸，脚尖自然朝前，身体微侧 30°。画面主体为黑色网纱中筒袜，纹理清晰无遮挡，搭配黑色皮鞋，脚部贴近画面底部，腿部占据画面 70% 视觉主体。`
+};
+
 type Props = {
   initialTemplates: TemplateConfig;
 };
@@ -72,13 +109,18 @@ export function Workbench({ initialTemplates }: Props) {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
 
+  const [singleInputDirectory, setSingleInputDirectory] = useState<SelectedDirectory | null>(null);
   const [batchInputDirectory, setBatchInputDirectory] = useState<SelectedDirectory | null>(null);
-  const [batchOutputDirectory, setBatchOutputDirectory] = useState<SelectedDirectory | null>(null);
   const [isBatchGenerating, setIsBatchGenerating] = useState(false);
   const [batchLogs, setBatchLogs] = useState<string[]>([]);
+  const [isStopRequested, setIsStopRequested] = useState(false);
+  const [imageRetryLimit, setImageRetryLimit] = useState<number>(DEFAULT_IMAGE_RETRY_LIMIT);
+  const [continueFromExisting, setContinueFromExisting] = useState<boolean>(true);
+
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
+  const stopRequestedRef = useRef(false);
 
   const uploadPreviews = useUploadPreviews(uploads);
-  const hasAllFiles = uploads.every((slot) => slot.file);
 
   async function handleSaveTemplate() {
     setIsSavingTemplate(true);
@@ -117,59 +159,159 @@ export function Workbench({ initialTemplates }: Props) {
     }
   }
 
+  async function handlePickSingleInputDirectory() {
+    try {
+      const directoryHandle = await pickDirectory("single-input", "readwrite");
+      const granted = await ensureDirectoryPermission(directoryHandle, "readwrite");
+      if (!granted) {
+        throw new Error("未获得单组输入目录写入权限，无法回写 result_0 到 result_5");
+      }
+      setSingleInputDirectory({ name: directoryHandle.name, handle: directoryHandle });
+    } catch (error) {
+      if (!isAbortError(error)) {
+        setErrorMessage(toErrorMessage(error, "选择单组输入目录失败"));
+      }
+    }
+  }
+
+  function handleStopTasks() {
+    markStopRequested();
+    activeAbortControllerRef.current?.abort();
+    setStatusMessage("已请求停止，正在中断当前任务...");
+    appendBatchLog("已请求停止，等待当前请求返回...");
+  }
+
+  function createRunAbortController(): AbortController {
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+    clearStopRequested();
+    return controller;
+  }
+
+  function clearRunAbortController(controller: AbortController) {
+    if (activeAbortControllerRef.current === controller) {
+      activeAbortControllerRef.current = null;
+    }
+    clearStopRequested();
+  }
+
   async function handleStartGeneration() {
     setErrorMessage("");
     setStatusMessage("");
-    if (!hasAllFiles) {
-      setErrorMessage("请先上传完整的4张参考图");
+    if (!singleInputDirectory) {
+      setErrorMessage("单组模式请先选择“单组输入目录”，系统会从该目录读取输入图并回写 result_0 到 result_5");
       return;
     }
 
+    const runAbortController = createRunAbortController();
     setIsGenerating(true);
     try {
-      setStatusMessage("正在提交单组任务...");
-      const formData = new FormData();
-      formData.append("prompt", template.mainPrompt);
-      formData.append("aspectRatio", aspectRatio);
-      formData.append("outputSize", outputSize);
-      for (const slot of uploads) {
-        if (slot.file) {
-          formData.append(slot.role, slot.file);
+      const stepOnePrompt = buildStepOnePrompt(template.mainPrompt, template.stepOnePrompt);
+      const stepTwoPrompt = buildStepTwoPrompt(template.stepTwoPrompt);
+      const referenceFiles = await readBatchGroupInput(singleInputDirectory.handle);
+      const expectedFiles = ["result_0.png", "result_1.png", "result_2.png", "result_3.png", "result_4.png", "result_5.png"];
+
+      if (continueFromExisting) {
+        const missing = await listMissingResultFiles(singleInputDirectory.handle, expectedFiles);
+        if (missing.length === 0) {
+          setStatusMessage("单组目录已存在 result_0 到 result_5，已跳过。");
+          return;
         }
       }
 
-      const finalImageUrl = await submitAndWaitImage(formData, (message) => setStatusMessage(message));
-      setGeneratedImageUrl(finalImageUrl);
-      setStatusMessage("生成完成，已在右侧展示。");
+      let stepOneBlob: Blob;
+      const hasResult0 = continueFromExisting && (await fileExists(singleInputDirectory.handle, "result_0.png"));
+      if (hasResult0) {
+        stepOneBlob = await readBlobFile(singleInputDirectory.handle, "result_0.png");
+        setStatusMessage("单组第1步：检测到已存在 result_0.png，跳过重生。");
+      } else {
+        setStatusMessage("单组第1步：正在生成 result_0...");
+        const stepOneSource = await generateImageWithPerImageRetry({
+          createFormData: () =>
+            buildImageGenerationFormData({
+              prompt: stepOnePrompt,
+              aspectRatio: BATCH_ASPECT_RATIO,
+              outputSize,
+              files: referenceFiles
+          }),
+          onProgress: (message) => setStatusMessage(`单组第1步：${message}`),
+          taskLabel: "单组第1步 result_0",
+          signal: runAbortController.signal
+        });
+        setGeneratedImageUrl(stepOneSource);
+
+        throwIfStopRequested();
+        stepOneBlob = await fetchImageBlob(stepOneSource, runAbortController.signal);
+        await writeBlobFile(singleInputDirectory.handle, "result_0.png", stepOneBlob);
+        setStatusMessage("单组第1步：已写入 result_0.png");
+      }
+      const result0File = new File([stepOneBlob], "result_0.png", { type: stepOneBlob.type || "image/png" });
+
+      let latestVariantSource = generatedImageUrl;
+      for (let variantIndex = 1; variantIndex <= BATCH_VARIANT_COUNT; variantIndex++) {
+        if (continueFromExisting && (await fileExists(singleInputDirectory.handle, `result_${variantIndex}.png`))) {
+          setStatusMessage(`单组第2步：result_${variantIndex}.png 已存在，跳过。`);
+          continue;
+        }
+
+        throwIfStopRequested();
+        setStatusMessage(`单组第2步：正在生成 result_${variantIndex}...`);
+        const variantSource = await generateImageWithPerImageRetry({
+          createFormData: () =>
+            buildImageGenerationFormData({
+              prompt: buildSingleVariantPrompt(stepTwoPrompt, variantIndex),
+              aspectRatio: BATCH_ASPECT_RATIO,
+              outputSize,
+              files: [result0File]
+            }),
+          onProgress: (message) => setStatusMessage(`单组第2步 result_${variantIndex}：${message}`),
+          taskLabel: `单组第2步 result_${variantIndex}`,
+          signal: runAbortController.signal
+        });
+        const variantBlob = await fetchImageBlob(variantSource, runAbortController.signal);
+        if (singleInputDirectory) {
+          await writeBlobFile(singleInputDirectory.handle, `result_${variantIndex}.png`, variantBlob);
+          setStatusMessage(`单组第2步：已写入 result_${variantIndex}.png`);
+        }
+        latestVariantSource = variantSource;
+        setGeneratedImageUrl(variantSource);
+        if (variantIndex < BATCH_VARIANT_COUNT) {
+          await sleepWithSignal(THROTTLE_BETWEEN_IMAGES_MS, runAbortController.signal);
+        }
+      }
+
+      if (latestVariantSource) {
+        setGeneratedImageUrl(latestVariantSource);
+      }
+      setStatusMessage(
+        "单组两步流程完成，已写入该输入目录：result_0.png 到 result_5.png。"
+      );
     } catch (error) {
-      setErrorMessage(toErrorMessage(error, "单组生成失败"));
+      if (isAbortLikeError(error)) {
+        setStatusMessage("单组任务已停止。");
+      } else {
+        setErrorMessage(toErrorMessage(error, "单组生成失败"));
+      }
     } finally {
       setIsGenerating(false);
+      clearRunAbortController(runAbortController);
     }
   }
 
   async function handlePickBatchInputDirectory() {
     try {
-      const directoryHandle = await pickDirectory("batch-input", "read");
+      const directoryHandle = await pickDirectory("batch-input", "readwrite");
+      const granted = await ensureDirectoryPermission(directoryHandle, "readwrite");
+      if (!granted) {
+        throw new Error("未获得输入目录写入权限，无法回写 result_0 到 result_5");
+      }
       setBatchInputDirectory({ name: directoryHandle.name, handle: directoryHandle });
     } catch (error) {
       if (!isAbortError(error)) {
         setErrorMessage(toErrorMessage(error, "选择批量输入目录失败"));
-      }
-    }
-  }
-
-  async function handlePickBatchOutputDirectory() {
-    try {
-      const directoryHandle = await pickDirectory("batch-output", "readwrite");
-      const granted = await ensureDirectoryPermission(directoryHandle, "readwrite");
-      if (!granted) {
-        throw new Error("未获得批量输出目录写入权限");
-      }
-      setBatchOutputDirectory({ name: directoryHandle.name, handle: directoryHandle });
-    } catch (error) {
-      if (!isAbortError(error)) {
-        setErrorMessage(toErrorMessage(error, "选择批量输出目录失败"));
       }
     }
   }
@@ -183,11 +325,8 @@ export function Workbench({ initialTemplates }: Props) {
       setErrorMessage("请先选择批量输入目录");
       return;
     }
-    if (!batchOutputDirectory) {
-      setErrorMessage("请先选择批量输出目录");
-      return;
-    }
 
+    const runAbortController = createRunAbortController();
     setIsBatchGenerating(true);
     try {
       const groups = await listSubDirectories(batchInputDirectory.handle);
@@ -195,31 +334,98 @@ export function Workbench({ initialTemplates }: Props) {
         throw new Error("输入目录下没有子文件夹");
       }
 
+      const stepOnePrompt = buildStepOnePrompt(template.mainPrompt, template.stepOnePrompt);
+      const stepTwoPrompt = buildStepTwoPrompt(template.stepTwoPrompt);
+
       let success = 0;
       let failed = 0;
       appendBatchLog(`共发现 ${groups.length} 组任务，开始处理...`);
+      appendBatchLog(`目录读取顺序：背景 -> 产品 -> 服装 -> 鞋子；模型输入顺序：产品 -> 鞋子 -> 服装 -> 背景。`);
 
       for (let i = 0; i < groups.length; i++) {
+        throwIfStopRequested();
         const group = groups[i];
+        if (i > 0) {
+          appendBatchLog(`等待 ${Math.round(THROTTLE_BETWEEN_GROUPS_MS / 1000)} 秒，降低限流风险...`);
+          await sleepWithSignal(THROTTLE_BETWEEN_GROUPS_MS, runAbortController.signal);
+        }
         appendBatchLog(`[${i + 1}/${groups.length}] 处理：${group.name}`);
         try {
-          const { prompt, files } = await readGroupInput(group.handle, template.mainPrompt);
+          const referenceFiles = await readBatchGroupInput(group.handle);
+          const expectedFiles = ["result_0.png", "result_1.png", "result_2.png", "result_3.png", "result_4.png", "result_5.png"];
+          if (continueFromExisting) {
+            const missing = await listMissingResultFiles(group.handle, expectedFiles);
+            if (missing.length === 0) {
+              success += 1;
+              appendBatchLog(`[${group.name}] 已存在 result_0~5，跳过。`);
+              continue;
+            }
+          }
 
-          const formData = new FormData();
-          formData.append("prompt", prompt);
-          formData.append("aspectRatio", aspectRatio);
-          formData.append("outputSize", outputSize);
-          formData.append("sock", files[0]);
-          formData.append("shoe", files[1]);
-          formData.append("outfit", files[2]);
-          formData.append("background", files[3]);
+          let stepOneBlob: Blob;
+          if (continueFromExisting && (await fileExists(group.handle, "result_0.png"))) {
+            stepOneBlob = await readBlobFile(group.handle, "result_0.png");
+            appendBatchLog(`[${group.name}] 检测到 result_0.png，跳过第一步重生。`);
+          } else {
+            const stepOneSource = await generateImageWithPerImageRetry({
+              createFormData: () =>
+                buildImageGenerationFormData({
+                  prompt: stepOnePrompt,
+                  aspectRatio: BATCH_ASPECT_RATIO,
+                  outputSize,
+                  files: referenceFiles
+              }),
+              onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
+              taskLabel: `${group.name} result_0`,
+              signal: runAbortController.signal
+            });
+            stepOneBlob = await fetchImageBlob(stepOneSource, runAbortController.signal);
+            await writeBlobFile(group.handle, "result_0.png", stepOneBlob);
+            setGeneratedImageUrl(stepOneSource);
+            appendBatchLog(`[${group.name}] 已保存 result_0.png`);
+          }
 
-          const imageUrl = await submitAndWaitImage(formData, (message) => appendBatchLog(`[${group.name}] ${message}`));
-          setGeneratedImageUrl(imageUrl);
-          await saveBatchResult(batchOutputDirectory.handle, group.name, imageUrl, prompt);
+          const result0File = new File([stepOneBlob], "result_0.png", { type: stepOneBlob.type || "image/png" });
+          let latestVariantSource: string | null = null;
+
+          for (let variantIndex = 1; variantIndex <= BATCH_VARIANT_COUNT; variantIndex++) {
+            if (continueFromExisting && (await fileExists(group.handle, `result_${variantIndex}.png`))) {
+              appendBatchLog(`[${group.name}] result_${variantIndex}.png 已存在，跳过。`);
+              continue;
+            }
+            throwIfStopRequested();
+            appendBatchLog(`[${group.name}] 开始生成 result_${variantIndex}.png`);
+            const variantSource = await generateImageWithPerImageRetry({
+              createFormData: () =>
+                buildImageGenerationFormData({
+                  prompt: buildSingleVariantPrompt(stepTwoPrompt, variantIndex),
+                  aspectRatio: BATCH_ASPECT_RATIO,
+                  outputSize,
+                  files: [result0File]
+                }),
+              onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
+              taskLabel: `${group.name} result_${variantIndex}`,
+              signal: runAbortController.signal
+            });
+            const variantBlob = await fetchImageBlob(variantSource, runAbortController.signal);
+            await writeBlobFile(group.handle, `result_${variantIndex}.png`, variantBlob);
+            latestVariantSource = variantSource;
+            setGeneratedImageUrl(variantSource);
+            appendBatchLog(`[${group.name}] 已生成并写入 result_${variantIndex}.png`);
+            if (variantIndex < BATCH_VARIANT_COUNT) {
+              await sleepWithSignal(THROTTLE_BETWEEN_IMAGES_MS, runAbortController.signal);
+            }
+          }
+
+          if (latestVariantSource) {
+            setGeneratedImageUrl(latestVariantSource);
+          }
           success += 1;
-          appendBatchLog(`[${group.name}] 成功`);
+          appendBatchLog(`[${group.name}] 成功，已写入 result_0.png 到 result_5.png`);
         } catch (error) {
+          if (isAbortLikeError(error)) {
+            throw error;
+          }
           failed += 1;
           appendBatchLog(`[${group.name}] 失败：${toErrorMessage(error, "未知错误")}`);
         }
@@ -227,16 +433,22 @@ export function Workbench({ initialTemplates }: Props) {
 
       setStatusMessage(`批量完成：成功 ${success} 组，失败 ${failed} 组`);
     } catch (error) {
-      setErrorMessage(toErrorMessage(error, "批量生成失败"));
+      if (isAbortLikeError(error)) {
+        setStatusMessage("批量任务已停止。");
+      } else {
+        setErrorMessage(toErrorMessage(error, "批量生成失败"));
+      }
     } finally {
       setIsBatchGenerating(false);
+      clearRunAbortController(runAbortController);
     }
   }
 
-  async function submitAndWaitImage(formData: FormData, onProgress?: (message: string) => void): Promise<string> {
+  async function submitAndWaitImage(formData: FormData, onProgress?: (message: string) => void, signal?: AbortSignal): Promise<string> {
     const response = await fetch("/api/generate", {
       method: "POST",
-      body: formData
+      body: formData,
+      signal
     });
     const payload = (await response.json()) as GeneratePayload;
     if (!response.ok) {
@@ -253,14 +465,49 @@ export function Workbench({ initialTemplates }: Props) {
       throw new Error(payload.message || "未返回任务ID");
     }
 
-    return pollTaskUntilDone(taskId, onProgress);
+    return pollTaskUntilDone(taskId, onProgress, signal);
   }
 
-  async function pollTaskUntilDone(taskId: string, onProgress?: (message: string) => void): Promise<string> {
+  async function generateImageWithPerImageRetry(params: {
+    createFormData: () => FormData;
+    taskLabel: string;
+    signal?: AbortSignal;
+    onProgress?: (message: string) => void;
+  }): Promise<string> {
+    const { createFormData, taskLabel, signal, onProgress } = params;
+    const attempts = Math.max(1, Math.floor(imageRetryLimit) + 1);
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        if (attempt > 1) {
+          onProgress?.(`${taskLabel} 第 ${attempt} 次尝试...`);
+        }
+        throwIfStopRequested();
+        const source = await submitAndWaitImage(createFormData(), onProgress, signal);
+        return source;
+      } catch (error) {
+        if (isAbortLikeError(error)) {
+          throw error;
+        }
+        const reason = toErrorMessage(error, "未知错误");
+        const isLastAttempt = attempt >= attempts;
+        if (isLastAttempt) {
+          throw error;
+        }
+        onProgress?.(`${taskLabel} 失败：${reason}；准备重试（${attempt}/${attempts - 1}）`);
+        await sleepWithSignal(1800 * attempt, signal);
+      }
+    }
+
+    throw new Error(`${taskLabel} 重试后仍失败`);
+  }
+
+  async function pollTaskUntilDone(taskId: string, onProgress?: (message: string) => void, signal?: AbortSignal): Promise<string> {
     const maxAttempts = 50;
     const intervalMs = 3000;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const response = await fetch(`/api/generate?taskId=${encodeURIComponent(taskId)}`, { method: "GET" });
+      throwIfStopRequested();
+      const response = await fetch(`/api/generate?taskId=${encodeURIComponent(taskId)}`, { method: "GET", signal });
       const payload = (await response.json()) as {
         status?: number;
         imageUrl?: string | null;
@@ -280,7 +527,7 @@ export function Workbench({ initialTemplates }: Props) {
 
       if (attempt < maxAttempts) {
         onProgress?.(`任务进行中 (${attempt}/${maxAttempts})，ID: ${taskId}`);
-        await sleep(intervalMs);
+        await sleepWithSignal(intervalMs, signal);
       }
     }
 
@@ -291,6 +538,22 @@ export function Workbench({ initialTemplates }: Props) {
     setBatchLogs((current) => [...current, `${new Date().toLocaleTimeString()} ${message}`]);
   }
 
+  function markStopRequested() {
+    stopRequestedRef.current = true;
+    setIsStopRequested(true);
+  }
+
+  function clearStopRequested() {
+    stopRequestedRef.current = false;
+    setIsStopRequested(false);
+  }
+
+  function throwIfStopRequested() {
+    if (stopRequestedRef.current) {
+      throw new Error(MANUAL_STOP_MESSAGE);
+    }
+  }
+
   function updateUpload(role: UploadRole, file: File | null) {
     setUploads((current) => current.map((slot) => (slot.role === role ? { ...slot, file } : slot)));
   }
@@ -299,9 +562,9 @@ export function Workbench({ initialTemplates }: Props) {
     <main className="page-shell">
       <section className="hero">
         <div className="muted tiny">当前输出画质：{outputSize}</div>
-        <span className="hero-badge">四图主图系统 · 中文版</span>
+        <span className="hero-badge">四图主图系统 · 两步批处理</span>
         <h1>输入产品/模特/场景，生成展示图</h1>
-        <p>支持单组与批量模式。批量模式下，每个子文件夹一组（4张图+可选txt提示词）。</p>
+        <p>批量模式会按每个子文件夹直接回写 result_0 到 result_5，不改变原文件结构。</p>
       </section>
 
       <div className="layout-grid">
@@ -311,7 +574,7 @@ export function Workbench({ initialTemplates }: Props) {
               <div className="section-header">
                 <div>
                   <h2>批量生图</h2>
-                  <p>输入目录下每个子文件夹为一组，默认按文件名排序取前4张图。</p>
+                  <p>每个子文件夹作为一组，目录读取顺序按“背景-产品-服装-鞋子”，模型输入顺序会自动重排成“产品-鞋子-服装-背景”。</p>
                 </div>
                 <span className="status-pill status-running">{isBatchGenerating ? "运行中" : "待开始"}</span>
               </div>
@@ -319,16 +582,38 @@ export function Workbench({ initialTemplates }: Props) {
                 <button className="secondary-button" onClick={handlePickBatchInputDirectory}>
                   选择输入目录
                 </button>
-                <button className="secondary-button" onClick={handlePickBatchOutputDirectory}>
-                  选择输出目录
-                </button>
                 <button className="primary-button" disabled={isBatchGenerating} onClick={handleStartBatchGeneration}>
                   {isBatchGenerating ? "批量生成中..." : "开始批量生图"}
                 </button>
+                <button className="danger-button" disabled={(!isBatchGenerating && !isGenerating) || isStopRequested} onClick={handleStopTasks}>
+                  {isStopRequested ? "停止中..." : "停止任务"}
+                </button>
+              </div>
+              <div className="toolbar">
+                <div className="field">
+                  <label htmlFor="imageRetryLimit">单张失败重试次数</label>
+                  <input
+                    id="imageRetryLimit"
+                    type="number"
+                    min={0}
+                    max={8}
+                    step={1}
+                    value={imageRetryLimit}
+                    onChange={(event) => setImageRetryLimit(clampRetryLimit(event.target.value))}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="continueFromExisting">断点续跑</label>
+                  <select id="continueFromExisting" value={continueFromExisting ? "on" : "off"} onChange={(event) => setContinueFromExisting(event.target.value === "on")}>
+                    <option value="on">开启（跳过已存在 result 文件）</option>
+                    <option value="off">关闭（整组重跑覆盖）</option>
+                  </select>
+                </div>
               </div>
               <div className="stack">
                 <div className="note-card tiny">输入目录：{batchInputDirectory ? batchInputDirectory.name : "未选择"}</div>
-                <div className="note-card tiny">输出目录：{batchOutputDirectory ? batchOutputDirectory.name : "未选择"}</div>
+                <div className="note-card tiny">输出规则：结果直接写回各子文件夹，命名为 result_0.png 到 result_5.png</div>
+                <div className="note-card tiny">当前策略：单张失败最多重试 {imageRetryLimit} 次；{continueFromExisting ? "开启断点续跑" : "关闭断点续跑"}。</div>
               </div>
             </div>
 
@@ -336,8 +621,15 @@ export function Workbench({ initialTemplates }: Props) {
               <div className="section-header">
                 <div>
                   <h2>单组输入</h2>
-                  <p>按图1-图4顺序上传参考图。</p>
+                  <p>单组生成会从“单组输入目录”读取图片并回写 result_0 到 result_5。上传区仅用于预览与对照。</p>
                 </div>
+              </div>
+
+              <div className="toolbar-wide">
+                <button className="secondary-button" onClick={handlePickSingleInputDirectory}>
+                  选择单组输入目录
+                </button>
+                <div className="note-card tiny">单组目录：{singleInputDirectory ? singleInputDirectory.name : "未选择（仅预览，不回写）"}</div>
               </div>
 
               <div className="upload-grid">
@@ -360,7 +652,7 @@ export function Workbench({ initialTemplates }: Props) {
               <div className="section-header">
                 <div>
                   <h3>参数与模板</h3>
-                  <p>可编辑主提示词模板，支持本地保存。</p>
+                  <p>左下角可直接编辑基础提示词、第一步微调提示词和第二步裂变提示词。</p>
                 </div>
               </div>
               <div className="toolbar">
@@ -401,13 +693,27 @@ export function Workbench({ initialTemplates }: Props) {
                 </div>
               </div>
 
-              <div className="field">
-                <textarea value={template.mainPrompt} onChange={(event) => setTemplate((current) => ({ ...current, mainPrompt: event.target.value }))} />
+              <div className="stack">
+                <div className="field">
+                  <label htmlFor="mainPrompt">基础提示词</label>
+                  <textarea id="mainPrompt" value={template.mainPrompt} onChange={(event) => setTemplate((current) => ({ ...current, mainPrompt: event.target.value }))} />
+                </div>
+                <div className="field">
+                  <label htmlFor="stepOnePrompt">第一步提示词微调</label>
+                  <textarea id="stepOnePrompt" value={template.stepOnePrompt} onChange={(event) => setTemplate((current) => ({ ...current, stepOnePrompt: event.target.value }))} />
+                </div>
+                <div className="field">
+                  <label htmlFor="stepTwoPrompt">第二步裂变提示词</label>
+                  <textarea id="stepTwoPrompt" value={template.stepTwoPrompt} onChange={(event) => setTemplate((current) => ({ ...current, stepTwoPrompt: event.target.value }))} />
+                </div>
               </div>
 
               <div className="toolbar-wide">
-                <button className="primary-button" disabled={isGenerating || isBatchGenerating} onClick={handleStartGeneration}>
+                <button className="primary-button" disabled={isGenerating || isBatchGenerating || !singleInputDirectory} onClick={handleStartGeneration}>
                   {isGenerating ? "单组生成中..." : "开始单组生图"}
+                </button>
+                <button className="danger-button" disabled={(!isBatchGenerating && !isGenerating) || isStopRequested} onClick={handleStopTasks}>
+                  {isStopRequested ? "停止中..." : "停止任务"}
                 </button>
               </div>
             </div>
@@ -424,7 +730,7 @@ export function Workbench({ initialTemplates }: Props) {
                 </div>
               </div>
               <div className="upload-card">
-                <div className="preview-box">
+                <div className="preview-box preview-full">
                   {generatedImageUrl ? <img alt="最新生成结果" src={generatedImageUrl} /> : <div className="preview-placeholder">暂无结果图</div>}
                 </div>
                 {generatedImageUrl ? (
@@ -466,9 +772,90 @@ export function Workbench({ initialTemplates }: Props) {
   );
 }
 
-async function readGroupInput(directoryHandle: FileSystemDirectoryHandle, fallbackPrompt: string): Promise<{ prompt: string; files: [File, File, File, File] }> {
+function buildStepOnePrompt(mainPrompt: string, stepOnePrompt: string): string {
+  const base = mainPrompt.trim();
+  const tweak = stepOnePrompt.trim();
+  if (!base) {
+    return tweak;
+  }
+  if (!tweak) {
+    return base;
+  }
+  return `${base}\n\n${tweak}`;
+}
+
+function buildImageGenerationFormData(params: {
+  prompt: string;
+  aspectRatio: MainAspectRatio;
+  outputSize: OutputSize;
+  files: File[];
+}): FormData {
+  const formData = new FormData();
+  formData.append("prompt", buildPromptWithProductLock(params.prompt));
+  formData.append("aspectRatio", params.aspectRatio);
+  formData.append("outputSize", params.outputSize);
+
+  if (params.files.length === 4) {
+    formData.append("sock", params.files[0]);
+    formData.append("shoe", params.files[1]);
+    formData.append("outfit", params.files[2]);
+    formData.append("background", params.files[3]);
+    return formData;
+  }
+
+  if (params.files.length === 1) {
+    formData.append("sock", params.files[0]);
+    return formData;
+  }
+
+  throw new Error(`不支持的输入图片数量：${params.files.length}`);
+}
+
+function buildPromptWithProductLock(prompt: string): string {
+  const trimmed = prompt.trim();
+  if (!trimmed) {
+    return PRODUCT_LOCK_PROMPT;
+  }
+  if (trimmed.includes("【产品硬约束（必须执行）】")) {
+    return appendStrictConsistencyPrompt(trimmed);
+  }
+  return appendStrictConsistencyPrompt(`${trimmed}\n\n${PRODUCT_LOCK_PROMPT}`);
+}
+
+function appendStrictConsistencyPrompt(prompt: string): string {
+  if (prompt.includes("【强一致性约束（最高优先级，必须执行）】")) {
+    return prompt;
+  }
+  return `${prompt}\n\n${STRICT_CONSISTENCY_PROMPT}`;
+}
+
+function buildStepTwoPrompt(stepTwoPrompt: string): string {
+  return stepTwoPrompt.trim();
+}
+
+function buildSingleVariantPrompt(stepTwoPrompt: string, variantIndex: number): string {
+  const actionPrompt = VARIANT_ACTION_PROMPTS[variantIndex];
+  if (!actionPrompt) {
+    throw new Error(`无效的裂变索引：${variantIndex}`);
+  }
+
+  const base = stepTwoPrompt.trim();
+  return `${base}
+
+【本次执行模式（必须）】
+仅生成 1 张图片，本次只执行以下动作要求，不允许出现其他动作：
+${actionPrompt}
+
+【禁止项（必须）】
+禁止把多个动作放进同一张图；
+禁止拼图、分屏、九宫格、连拍排版、海报排版；
+禁止在画面中添加文字、序号、水印、边框。
+
+如果上文出现“生成5张”，以本节“仅生成1张”为最高优先级执行。`;
+}
+
+async function readBatchGroupInput(directoryHandle: FileSystemDirectoryHandle): Promise<[File, File, File, File]> {
   const files: File[] = [];
-  const txtFiles: File[] = [];
 
   const iteratorTarget = directoryHandle as unknown as {
     entries: () => AsyncIterableIterator<[string, FileSystemHandle]>;
@@ -481,31 +868,23 @@ async function readGroupInput(directoryHandle: FileSystemDirectoryHandle, fallba
 
     const fileHandle = handle as FileSystemFileHandle;
     const file = await fileHandle.getFile();
-    if (isImageFile(file)) {
+    if (isImageFile(file) && !isGeneratedResultFile(file.name)) {
       files.push(file);
-    } else if (file.name.toLowerCase().endsWith(".txt")) {
-      txtFiles.push(file);
     }
   }
 
   files.sort((a, b) => a.name.localeCompare(b.name, "zh-CN", { numeric: true }));
+
   if (files.length < 4) {
     throw new Error("该组图片不足4张");
   }
 
-  let prompt = fallbackPrompt;
-  if (txtFiles.length > 0) {
-    txtFiles.sort((a, b) => a.name.localeCompare(b.name, "zh-CN", { numeric: true }));
-    const customPrompt = (await txtFiles[0].text()).trim();
-    if (customPrompt) {
-      prompt = customPrompt;
-    }
-  }
+  const background = files[0];
+  const product = files[1];
+  const outfit = files[2];
+  const shoe = files[3];
 
-  return {
-    prompt,
-    files: [files[0], files[1], files[2], files[3]]
-  };
+  return [product, shoe, outfit, background];
 }
 
 async function listSubDirectories(root: FileSystemDirectoryHandle): Promise<Array<{ name: string; handle: FileSystemDirectoryHandle }>> {
@@ -524,32 +903,6 @@ async function listSubDirectories(root: FileSystemDirectoryHandle): Promise<Arra
   return dirs;
 }
 
-async function saveBatchResult(outputRoot: FileSystemDirectoryHandle, groupName: string, imageUrl: string, prompt: string): Promise<void> {
-  const groupDir = await outputRoot.getDirectoryHandle(groupName, { create: true });
-  const meta = {
-    groupName,
-    imageUrl,
-    prompt,
-    savedAt: new Date().toISOString()
-  };
-
-  await writeTextFile(groupDir, "result.meta.json", JSON.stringify(meta, null, 2));
-
-  try {
-    const blob = await fetchImageBlob(imageUrl);
-    await writeBlobFile(groupDir, "result.png", blob);
-  } catch {
-    await writeTextFile(groupDir, "result.url.txt", imageUrl);
-  }
-}
-
-async function writeTextFile(directoryHandle: FileSystemDirectoryHandle, fileName: string, content: string): Promise<void> {
-  const fileHandle = await directoryHandle.getFileHandle(fileName, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(content);
-  await writable.close();
-}
-
 async function writeBlobFile(directoryHandle: FileSystemDirectoryHandle, fileName: string, blob: Blob): Promise<void> {
   const fileHandle = await directoryHandle.getFileHandle(fileName, { create: true });
   const writable = await fileHandle.createWritable();
@@ -557,12 +910,28 @@ async function writeBlobFile(directoryHandle: FileSystemDirectoryHandle, fileNam
   await writable.close();
 }
 
-function isImageFile(file: File): boolean {
-  if (file.type.startsWith("image/")) {
+async function fileExists(directoryHandle: FileSystemDirectoryHandle, fileName: string): Promise<boolean> {
+  try {
+    await directoryHandle.getFileHandle(fileName, { create: false });
     return true;
+  } catch {
+    return false;
   }
-  const lower = file.name.toLowerCase();
-  return [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"].some((ext) => lower.endsWith(ext));
+}
+
+async function readBlobFile(directoryHandle: FileSystemDirectoryHandle, fileName: string): Promise<Blob> {
+  const handle = await directoryHandle.getFileHandle(fileName, { create: false });
+  return await handle.getFile();
+}
+
+async function listMissingResultFiles(directoryHandle: FileSystemDirectoryHandle, fileNames: string[]): Promise<string[]> {
+  const missing: string[] = [];
+  for (const fileName of fileNames) {
+    if (!(await fileExists(directoryHandle, fileName))) {
+      missing.push(fileName);
+    }
+  }
+  return missing;
 }
 
 function useUploadPreviews(uploads: UploadSlot[]) {
@@ -646,8 +1015,43 @@ function toErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function isAbortLikeError(error: unknown): boolean {
+  if (isAbortError(error)) {
+    return true;
+  }
+  if (error instanceof Error) {
+    return error.message.includes(MANUAL_STOP_MESSAGE) || error.name === "AbortError";
+  }
+  return false;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    await sleep(ms);
+    return;
+  }
+  if (signal.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    signal.addEventListener("abort", onAbort);
+  });
 }
 
 async function downloadImageSource(source: string, fileName: string): Promise<void> {
@@ -663,12 +1067,12 @@ async function downloadImageSource(source: string, fileName: string): Promise<vo
   }
 }
 
-async function fetchImageBlob(source: string): Promise<Blob> {
+async function fetchImageBlob(source: string, signal?: AbortSignal): Promise<Blob> {
   if (source.startsWith("data:")) {
     return dataUrlToBlob(source);
   }
 
-  const response = await fetch(`/api/image-proxy?url=${encodeURIComponent(source)}`, { method: "GET" });
+  const response = await fetch(`/api/image-proxy?url=${encodeURIComponent(source)}`, { method: "GET", signal });
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
@@ -700,4 +1104,24 @@ function dataUrlToBlob(dataUrl: string): Blob {
 function buildResultFileName(): string {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `generated-${timestamp}.png`;
+}
+
+function isImageFile(file: File): boolean {
+  if (file.type.startsWith("image/")) {
+    return true;
+  }
+  const lower = file.name.toLowerCase();
+  return [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"].some((ext) => lower.endsWith(ext));
+}
+
+function isGeneratedResultFile(fileName: string): boolean {
+  return /^result_[0-5]\.(png|jpg|jpeg|webp|bmp|gif)$/i.test(fileName.trim());
+}
+
+function clampRetryLimit(input: string): number {
+  const parsed = Number.parseInt(input, 10);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_IMAGE_RETRY_LIMIT;
+  }
+  return Math.max(0, Math.min(8, parsed));
 }

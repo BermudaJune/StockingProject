@@ -1,6 +1,7 @@
 # Stockings Web 生图项目（Wuyin 异步接口）
 
 项目已改为调用：
+
 - 提交任务：`https://api.wuyinkeji.com/api/async/image_gpt`
 - 查询结果：`https://api.wuyinkeji.com/api/async/detail`
 
@@ -22,6 +23,7 @@ OYY_MODEL=gpt-image-2
 ```
 
 说明：
+
 - 鉴权使用 `Authorization: <WUYIN_API_KEY>` 请求头
 - `?key=...` 方式在你这把 key 上会返回 403（已实测）
 - 若要切到欧洋洋中转站：把 `IMAGE_PROVIDER=oyy`
