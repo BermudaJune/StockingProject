@@ -3,5 +3,6 @@ export type TemplateConfig = {
   stepOnePrompt: string;
   stepThreePrompt: string;
   stepTwoPrompt: string;
+  stepFourPrompt: string;
   updatedAt: string;
 };

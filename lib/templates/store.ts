@@ -24,6 +24,35 @@ export async function readTemplateConfig(filePath = CONFIG_FILE): Promise<Templa
       return defaults;
     }
 
+    const hasStepFourPrompt = typeof parsed.stepFourPrompt === "string" && parsed.stepFourPrompt.trim().length > 0;
+    if (!hasStepFourPrompt) {
+      const migrated: TemplateConfig = {
+        // legacy(4-step) -> new(5-step):
+        // old mainPrompt(A), stepOne(B), stepThree(C), stepTwo(D)
+        // new mainPrompt(P), stepOne(A), stepThree(B), stepTwo(C), stepFour(D)
+        mainPrompt: defaults.mainPrompt,
+        stepOnePrompt:
+          typeof parsed.mainPrompt === "string" && parsed.mainPrompt.trim()
+            ? normalizePrompt(parsed.mainPrompt)
+            : defaults.stepOnePrompt,
+        stepThreePrompt:
+          typeof parsed.stepOnePrompt === "string" && parsed.stepOnePrompt.trim()
+            ? normalizePrompt(parsed.stepOnePrompt)
+            : defaults.stepThreePrompt,
+        stepTwoPrompt:
+          typeof parsed.stepThreePrompt === "string" && parsed.stepThreePrompt.trim()
+            ? normalizePrompt(parsed.stepThreePrompt)
+            : defaults.stepTwoPrompt,
+        stepFourPrompt:
+          typeof parsed.stepTwoPrompt === "string" && parsed.stepTwoPrompt.trim()
+            ? normalizePrompt(parsed.stepTwoPrompt)
+            : defaults.stepFourPrompt,
+        updatedAt: new Date().toISOString()
+      };
+      await writeTemplateConfig(migrated, filePath);
+      return migrated;
+    }
+
     return {
       mainPrompt,
       stepOnePrompt:
@@ -38,6 +67,10 @@ export async function readTemplateConfig(filePath = CONFIG_FILE): Promise<Templa
         typeof parsed.stepTwoPrompt === "string" && parsed.stepTwoPrompt.trim()
           ? normalizePrompt(parsed.stepTwoPrompt)
           : defaults.stepTwoPrompt,
+      stepFourPrompt:
+        typeof parsed.stepFourPrompt === "string" && parsed.stepFourPrompt.trim()
+          ? normalizePrompt(parsed.stepFourPrompt)
+          : defaults.stepFourPrompt,
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString()
     };
   } catch (error) {
@@ -63,6 +96,7 @@ export async function writeTemplateConfig(config: TemplateConfig, filePath = CON
     stepOnePrompt: normalizePrompt(config.stepOnePrompt),
     stepThreePrompt: normalizePrompt(config.stepThreePrompt),
     stepTwoPrompt: normalizePrompt(config.stepTwoPrompt),
+    stepFourPrompt: normalizePrompt(config.stepFourPrompt),
     updatedAt: new Date().toISOString()
   };
 
