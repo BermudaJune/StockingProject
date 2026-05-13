@@ -365,6 +365,110 @@ button {
   align-items: center;
 }
 
+.home-shell {
+  display: grid;
+  gap: 18px;
+}
+
+.home-hero {
+  background:
+    radial-gradient(circle at 12% 8%, rgba(255, 255, 255, 0.72), transparent 34%),
+    radial-gradient(circle at 85% 18%, rgba(127, 77, 52, 0.08), transparent 30%),
+    linear-gradient(120deg, rgba(255, 255, 255, 0.65), rgba(247, 238, 225, 0.72));
+  border: 1px solid var(--line);
+  border-radius: 26px;
+  padding: 24px;
+  box-shadow: var(--shadow);
+}
+
+.workflow-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.workflow-card {
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  padding: 20px;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.82), rgba(244, 233, 216, 0.78));
+  box-shadow: 0 10px 30px rgba(60, 36, 19, 0.1);
+  display: grid;
+  gap: 10px;
+}
+
+.workflow-card-alt {
+  background: linear-gradient(145deg, rgba(255, 248, 240, 0.86), rgba(236, 220, 201, 0.8));
+}
+
+.workflow-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.workflow-top h2 {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+}
+
+.workflow-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.home-cta {
+  width: fit-content;
+  margin-top: 6px;
+  text-decoration: none;
+}
+
+.example-panel {
+  overflow: hidden;
+}
+
+.example-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.example-card {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.74);
+  padding: 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.example-card h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.example-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.example-visual {
+  border: 1px dashed var(--line-strong);
+  border-radius: 12px;
+  min-height: 76px;
+  display: grid;
+  place-items: center;
+  color: var(--accent-strong);
+  font-weight: 600;
+  background:
+    radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.7), transparent 35%),
+    linear-gradient(135deg, rgba(127, 77, 52, 0.05), rgba(127, 77, 52, 0.13));
+}
+
 @media (max-width: 1120px) {
   .layout-grid {
     grid-template-columns: 1fr;
@@ -378,7 +482,9 @@ button {
 
   .upload-grid,
   .result-grid,
-  .toolbar {
+  .toolbar,
+  .workflow-grid,
+  .example-grid {
     grid-template-columns: 1fr;
   }
 }

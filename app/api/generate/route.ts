@@ -1,10 +1,18 @@
-import { NextResponse } from "next/server";
+﻿import { NextResponse } from "next/server";
 
 const DEFAULT_SUBMIT_URL = "https://api.wuyinkeji.com/api/async/image_gpt";
 const DEFAULT_DETAIL_URL = "https://api.wuyinkeji.com/api/async/detail";
 const DEFAULT_OYY_BASE_URL = "https://www.oyy-ai.com";
 const DEFAULT_OYY_IMAGE_API_PATH = "/v1/images/edits";
 const DEFAULT_OYY_SOFT_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+const DEFAULT_GEMINI_API_PATH = "/v1beta/models/gemini-3-pro-image-preview:generateContent";
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com";
+const DEFAULT_OPENAI_CHAT_API_PATH = "/v1/chat/completions";
+
+type Provider = "banana" | "openai";
+type UploadFieldKey = "sock" | "shoe" | "outfit" | "background";
+type OyyRequestImageField = "image" | "image[]";
 
 type SubmitApiResponse = {
   code: number;
@@ -40,6 +48,56 @@ type OyyImageResponse = {
   };
 };
 
+type GeminiGenerateContentResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+        inline_data?: {
+          mime_type?: string;
+          data?: string;
+        };
+        inlineData?: {
+          mimeType?: string;
+          data?: string;
+        };
+      }>;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
+};
+
+type OpenAIChatCompletionsResponse = {
+  choices?: Array<{
+    message?: {
+      content?:
+        | string
+        | Array<{
+            type?: string;
+            text?: string;
+            image_url?: {
+              url?: string;
+            };
+            b64_json?: string;
+            data?: string;
+          }>;
+      images?: Array<{
+        b64_json?: string;
+        url?: string;
+      }>;
+    };
+  }>;
+  data?: Array<{
+    b64_json?: string;
+    url?: string;
+  }>;
+  error?: {
+    message?: string;
+  };
+};
+
 type ParsedUpstreamResponse<T> = {
   ok: boolean;
   status: number;
@@ -49,46 +107,24 @@ type ParsedUpstreamResponse<T> = {
 
 export async function POST(request: Request) {
   try {
-    const provider = getProvider();
     const formData = await request.formData();
+    const provider = resolveProvider(readOptionalField(formData, "modelProvider"));
     const prompt = readRequiredField(formData, "prompt");
 
-    if (provider === "oyy") {
-      return await handleOyyPost(formData, prompt, request.signal);
+    if (provider === "banana") {
+      return await handleGeminiPost(formData, prompt, request.signal);
     }
-    return await handleWuyinPost(formData, prompt);
+    return await handleOpenaiChatPost(formData, prompt, request.signal);
   } catch (error) {
     return NextResponse.json({ error: toErrorMessage(error) }, { status: 400 });
   }
 }
 
-export async function GET(request: Request) {
+export async function GET(_request: Request) {
   try {
-    const provider = getProvider();
-    if (provider === "oyy") {
-      return NextResponse.json({
-        status: 2,
-        message: "OYY 接口为同步返回，请直接查看 POST 返回的图片结果。"
-      });
-    }
-
-    const apiKey = getWuyinApiKey();
-    const { searchParams } = new URL(request.url);
-    const taskId = searchParams.get("taskId")?.trim();
-    if (!taskId) {
-      throw new Error("缺少 taskId 参数");
-    }
-
-    const detail = await fetchTaskDetail(taskId, apiKey);
-    const status = typeof detail.data?.status === "number" ? detail.data.status : 0;
-    const imageUrl = detail.data?.result?.[0] || null;
-    const detailMessage = detail.data?.message?.trim() || detail.msg || "";
-
     return NextResponse.json({
-      taskId,
-      status,
-      imageUrl,
-      message: detailMessage
+      status: 2,
+      message: "当前模型接口为同步返回，请直接使用 POST 返回的图片结果。"
     });
   } catch (error) {
     return NextResponse.json({ error: toErrorMessage(error) }, { status: 400 });
@@ -150,54 +186,14 @@ async function handleOyyPost(formData: FormData, prompt: string, signal?: AbortS
   const files = getImageFilesFromFormData(formData);
   const useGenerations = imageApiPath === "/v1/images/generations";
 
-  let lastErrorMessage = "OYY 请求失败";
-
   if (useGenerations) {
-    const parsed = await requestOyyGenerations({
-      baseUrl,
-      apiKey,
-      model,
-      prompt,
-      size,
-      signal
-    });
-    const json = parsed.json;
-    if (!json) {
-      throw new Error(buildUpstreamError("OYY 返回解析失败", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
-    }
-    const errorMessage = json.error?.message?.trim();
-    if (!parsed.ok || errorMessage) {
-      throw new Error(
-        buildUpstreamError("OYY 提交失败", {
-          httpStatus: parsed.status,
-          providerMsg: errorMessage || "",
-          raw: parsed.raw
-        })
-      );
-    }
-    const first = json.data?.[0];
-    const imageUrl = first?.url?.trim() || null;
-    const imageDataUrl = first?.b64_json ? `data:image/png;base64,${first.b64_json}` : null;
-    if (!imageUrl && !imageDataUrl) {
-      throw new Error(
-        buildUpstreamError("OYY 未返回图片", {
-          httpStatus: parsed.status,
-          providerMsg: "",
-          raw: parsed.raw
-        })
-      );
-    }
-    return NextResponse.json({
-      status: 2,
-      imageUrl,
-      imageDataUrl,
-      message: "生成完成"
-    });
+    const parsed = await requestOyyGenerations({ baseUrl, apiKey, model, prompt, size, signal });
+    return buildOyySuccessResponse(parsed, "OYY generations");
   }
 
   const responseVariants: OyyRequestImageField[] = ["image[]", "image"];
+  let lastErrorMessage = "OYY 鐠囬攱鐪版径杈Е";
   for (let i = 0; i < responseVariants.length; i++) {
-    const fieldName = responseVariants[i];
     try {
       const parsed = await requestOyyEdits({
         baseUrl,
@@ -206,45 +202,11 @@ async function handleOyyPost(formData: FormData, prompt: string, signal?: AbortS
         prompt,
         size,
         files,
-        imageFieldName: fieldName,
+        imageFieldName: responseVariants[i],
         imageApiPath,
         signal
       });
-      const json = parsed.json;
-      if (!json) {
-        throw new Error(buildUpstreamError("OYY 返回解析失败", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
-      }
-
-      const errorMessage = json.error?.message?.trim();
-      if (!parsed.ok || errorMessage) {
-        throw new Error(
-          buildUpstreamError("OYY 提交失败", {
-            httpStatus: parsed.status,
-            providerMsg: errorMessage || "",
-            raw: parsed.raw
-          })
-        );
-      }
-
-      const first = json.data?.[0];
-      const imageUrl = first?.url?.trim() || null;
-      const imageDataUrl = first?.b64_json ? `data:image/png;base64,${first.b64_json}` : null;
-      if (!imageUrl && !imageDataUrl) {
-        throw new Error(
-          buildUpstreamError("OYY 未返回图片", {
-            httpStatus: parsed.status,
-            providerMsg: "",
-            raw: parsed.raw
-          })
-        );
-      }
-
-      return NextResponse.json({
-        status: 2,
-        imageUrl,
-        imageDataUrl,
-        message: "生成完成"
-      });
+      return buildOyySuccessResponse(parsed, "OYY edits");
     } catch (error) {
       lastErrorMessage = toErrorMessage(error);
       if (i === responseVariants.length - 1) {
@@ -252,7 +214,255 @@ async function handleOyyPost(formData: FormData, prompt: string, signal?: AbortS
       }
     }
   }
+
   throw new Error(lastErrorMessage);
+}
+
+function buildOyySuccessResponse(parsed: ParsedUpstreamResponse<OyyImageResponse>, prefix: string) {
+  const json = parsed.json;
+  if (!json) {
+    throw new Error(buildUpstreamError(`${prefix} 鏉╂柨娲栫憴锝嗙€芥径杈Е`, { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
+  }
+  const errorMessage = json.error?.message?.trim();
+  if (!parsed.ok || errorMessage) {
+    throw new Error(
+      buildUpstreamError(`${prefix} 閹绘劒姘︽径杈Е`, {
+        httpStatus: parsed.status,
+        providerMsg: errorMessage || "",
+        raw: parsed.raw
+      })
+    );
+  }
+  const first = json.data?.[0];
+  const imageUrl = first?.url?.trim() || null;
+  const imageDataUrl = first?.b64_json ? `data:image/png;base64,${first.b64_json}` : null;
+  if (!imageUrl && !imageDataUrl) {
+    throw new Error("OYY 未返回图片结果");
+  }
+  return NextResponse.json({
+    status: 2,
+    imageUrl,
+    imageDataUrl,
+    message: "生成完成"
+  });
+}
+
+async function handleGeminiPost(formData: FormData, prompt: string, signal?: AbortSignal) {
+  const baseUrl = (
+    process.env.GEMINI_BASE_URL?.trim() ||
+    process.env.OYY_BASE_URL?.trim() ||
+    DEFAULT_GEMINI_BASE_URL
+  ).replace(/\/+$/, "");
+  const apiPath = normalizeApiPath(process.env.GEMINI_API_PATH?.trim() || DEFAULT_GEMINI_API_PATH);
+  const endpoint = resolveHttpEndpoint(baseUrl, apiPath);
+  const apiKey = getGeminiApiKey();
+  const files = getImageFilesFromFormData(formData);
+
+  const parts: Array<Record<string, unknown>> = [{ text: prompt }];
+  for (const file of files) {
+    const buffer = Buffer.from(await file.arrayBuffer());
+    parts.push({
+      inline_data: {
+        mime_type: file.type || "image/png",
+        data: buffer.toString("base64")
+      }
+    });
+  }
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts
+        }
+      ],
+      generationConfig: {
+        responseModalities: ["IMAGE", "TEXT"]
+      }
+    }),
+    cache: "no-store",
+    signal
+  });
+
+  const parsed = await parseUpstreamResponse<GeminiGenerateContentResponse>(response);
+  const json = parsed.json;
+  if (!json) {
+    throw new Error(buildUpstreamError("Gemini 鏉╂柨娲栫憴锝嗙€芥径杈Е", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
+  }
+  const errorMessage = json.error?.message?.trim();
+  if (!parsed.ok || errorMessage) {
+    throw new Error(
+      buildUpstreamError("Gemini 閹绘劒姘︽径杈Е", {
+        httpStatus: parsed.status,
+        providerMsg: errorMessage || "",
+        raw: parsed.raw
+      })
+    );
+  }
+
+  const candidateParts = json.candidates?.[0]?.content?.parts || [];
+  const imagePart = candidateParts.find((part) => part.inline_data?.data || part.inlineData?.data);
+  const imageData = imagePart?.inline_data?.data || imagePart?.inlineData?.data || "";
+  const imageMime = imagePart?.inline_data?.mime_type || imagePart?.inlineData?.mimeType || "image/png";
+  if (!imageData) {
+    throw new Error("Gemini 未返回图片数据");
+  }
+
+  return NextResponse.json({
+    status: 2,
+    imageDataUrl: `data:${imageMime};base64,${imageData}`,
+    message: "生成完成"
+  });
+}
+
+async function handleOpenaiChatPost(formData: FormData, prompt: string, signal?: AbortSignal) {
+  const baseUrl = (
+    process.env.OPENAI_BASE_URL?.trim() ||
+    process.env.OYY_BASE_URL?.trim() ||
+    DEFAULT_OPENAI_BASE_URL
+  ).replace(/\/+$/, "");
+  const apiPath = normalizeApiPath(process.env.OPENAI_CHAT_API_PATH?.trim() || DEFAULT_OPENAI_CHAT_API_PATH);
+  const endpoint = resolveHttpEndpoint(baseUrl, apiPath);
+  const apiKey = getOpenAIApiKey();
+  const model = process.env.OPENAI_CHAT_MODEL?.trim() || "gpt-4o";
+  const files = getImageFilesFromFormData(formData);
+
+  const contentParts: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+  for (const file of files) {
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const mime = file.type || "image/png";
+    contentParts.push({
+      type: "image_url",
+      image_url: {
+        url: `data:${mime};base64,${buffer.toString("base64")}`
+      }
+    });
+  }
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: contentParts
+        }
+      ],
+      max_tokens: 4096
+    }),
+    cache: "no-store",
+    signal
+  });
+
+  const parsed = await parseUpstreamResponse<OpenAIChatCompletionsResponse>(response);
+  const json = parsed.json;
+  if (!json) {
+    throw new Error(buildUpstreamError("OpenAI 杩斿洖瑙ｆ瀽澶辫触", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
+  }
+  const errorMessage = json.error?.message?.trim();
+  if (!parsed.ok || errorMessage) {
+    throw new Error(
+      buildUpstreamError("OpenAI 鎻愪氦澶辫触", {
+        httpStatus: parsed.status,
+        providerMsg: errorMessage || "",
+        raw: parsed.raw
+      })
+    );
+  }
+
+  const directDataImage = json.data?.[0];
+  if (directDataImage?.b64_json) {
+    return NextResponse.json({
+      status: 2,
+      imageDataUrl: `data:image/png;base64,${directDataImage.b64_json}`,
+      message: "鐢熸垚瀹屾垚"
+    });
+  }
+  if (directDataImage?.url) {
+    return NextResponse.json({
+      status: 2,
+      imageUrl: directDataImage.url,
+      message: "鐢熸垚瀹屾垚"
+    });
+  }
+
+  const message = json.choices?.[0]?.message;
+  const messageImages = message?.images || [];
+  if (messageImages[0]?.b64_json) {
+    return NextResponse.json({
+      status: 2,
+      imageDataUrl: `data:image/png;base64,${messageImages[0].b64_json}`,
+      message: "鐢熸垚瀹屾垚"
+    });
+  }
+  if (messageImages[0]?.url) {
+    return NextResponse.json({
+      status: 2,
+      imageUrl: messageImages[0].url,
+      message: "鐢熸垚瀹屾垚"
+    });
+  }
+
+  const messageContent = message?.content;
+  if (Array.isArray(messageContent)) {
+    const contentImage = messageContent.find((part) => part.image_url?.url || part.b64_json || part.data);
+    if (contentImage?.image_url?.url) {
+      return NextResponse.json({
+        status: 2,
+        imageUrl: contentImage.image_url.url,
+        message: "鐢熸垚瀹屾垚"
+      });
+    }
+    if (contentImage?.b64_json || contentImage?.data) {
+      return NextResponse.json({
+        status: 2,
+        imageDataUrl: `data:image/png;base64,${contentImage.b64_json || contentImage.data || ""}`,
+        message: "鐢熸垚瀹屾垚"
+      });
+    }
+
+    const textContent = messageContent
+      .map((part) => (typeof part.text === "string" ? part.text : ""))
+      .filter((text) => !!text)
+      .join("\n");
+    const extractedFromArrayText = extractImageFromText(textContent);
+    if (extractedFromArrayText) {
+      return NextResponse.json({
+        status: 2,
+        ...extractedFromArrayText,
+        message: "鐢熸垚瀹屾垚"
+      });
+    }
+  }
+
+  if (typeof messageContent === "string") {
+    const extractedFromString = extractImageFromText(messageContent);
+    if (extractedFromString) {
+      return NextResponse.json({
+        status: 2,
+        ...extractedFromString,
+        message: "鐢熸垚瀹屾垚"
+      });
+    }
+
+    const preview = messageContent.trim().slice(0, 240);
+    if (preview) {
+      throw new Error(`OpenAI /v1/chat/completions 鏈繑鍥炲彲瑙ｆ瀽鐨勫浘鐗囩粨鏋滐紱content棰勮=${preview}`);
+    }
+  }
+
+  throw new Error("OpenAI /v1/chat/completions 未返回可解析的图片结果");
 }
 
 async function requestOyyEdits(params: {
@@ -269,7 +479,7 @@ async function requestOyyEdits(params: {
   const { baseUrl, apiKey, model, prompt, size, files, imageFieldName, imageApiPath, signal } = params;
   const endpoint = `${baseUrl}${imageApiPath}`;
   const maxAttempts = 3;
-  let lastError = "OYY 请求失败";
+  let lastError = "OYY 鐠囬攱鐪版径杈Е";
   const timeoutMs = getOyySoftTimeoutMs();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -282,15 +492,19 @@ async function requestOyyEdits(params: {
     }
 
     try {
-      const response = await fetchWithSoftTimeout(endpoint, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`
+      const response = await fetchWithSoftTimeout(
+        endpoint,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`
+          },
+          body,
+          cache: "no-store",
+          signal
         },
-        body,
-        cache: "no-store",
-        signal
-      }, timeoutMs);
+        timeoutMs
+      );
 
       const parsed = await parseUpstreamResponse<OyyImageResponse>(response);
       if (isModerationBlockedOyyResponse(parsed)) {
@@ -327,7 +541,7 @@ async function requestOyyGenerations(params: {
   const { baseUrl, apiKey, model, prompt, size, signal } = params;
   const endpoint = `${baseUrl}/v1/images/generations`;
   const maxAttempts = 3;
-  let lastError = "OYY 请求失败";
+  let lastError = "OYY 鐠囬攱鐪版径杈Е";
   const timeoutMs = getOyySoftTimeoutMs();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -385,7 +599,7 @@ async function submitTaskWithRetry(params: {
 }): Promise<SubmitApiResponse> {
   const { submitUrl, apiKey, prompt, aspectRatio, urls } = params;
   const maxAttempts = 3;
-  let lastError = "提交失败";
+  let lastError = "閹绘劒姘︽径杈Е";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -411,27 +625,22 @@ async function submitTaskWithRetry(params: {
         return submitJson;
       }
 
-      lastError = buildUpstreamError("提交失败", {
+      lastError = buildUpstreamError("閹绘劒姘︽径杈Е", {
         httpStatus: parsed.status,
         providerMsg: submitJson?.msg || "",
         raw: parsed.raw
       });
-      const canRetry = /500|转发请求失败|目标服务器返回|timeout/i.test(lastError);
+      const canRetry = /500|timeout|network|fetch failed/i.test(lastError);
       if (!canRetry || attempt === maxAttempts) {
         throw new Error(lastError);
       }
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith("提交失败")) {
-        throw error;
-      }
-
       lastError = error instanceof Error ? error.message : String(error);
-      const canRetry = /500|转发请求失败|目标服务器返回|timeout|network|fetch failed/i.test(lastError);
+      const canRetry = /500|timeout|network|fetch failed/i.test(lastError);
       if (!canRetry || attempt === maxAttempts) {
         throw new Error(`提交失败：${lastError}`);
       }
     }
-
     await sleep(1200 * attempt);
   }
 
@@ -455,7 +664,7 @@ async function waitForTaskResult(taskId: string, apiKey: string): Promise<Detail
     const parsed = await parseUpstreamResponse<DetailApiResponse>(response);
     const json = parsed.json;
     if (!json) {
-      throw new Error(buildUpstreamError("轮询结果解析失败", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
+      throw new Error(buildUpstreamError("鏉烆喛顕楃紒鎾寸亯鐟欙絾鐎芥径杈Е", { httpStatus: parsed.status, providerMsg: "", raw: parsed.raw }));
     }
     latest = json;
 
@@ -473,7 +682,6 @@ async function waitForTaskResult(taskId: string, apiKey: string): Promise<Detail
 
 async function extractImageUrlsFromFormData(formData: FormData): Promise<string[]> {
   const files = collectImageFilesFromFormData(formData);
-
   return await Promise.all(
     files.map(async (file) => {
       const buffer = Buffer.from(await file.arrayBuffer());
@@ -499,7 +707,6 @@ async function fetchTaskDetail(taskId: string, apiKey: string): Promise<DetailAp
   if (!parsed.ok || json.code !== 200 || !json.data) {
     throw new Error(buildUpstreamError("结果查询失败", { httpStatus: parsed.status, providerMsg: json.msg || "", raw: parsed.raw }));
   }
-
   return json;
 }
 
@@ -523,6 +730,28 @@ function getOyyApiKey(): string {
   return apiKey;
 }
 
+function getGeminiApiKey(): string {
+  const apiKey =
+    process.env.GEMINI_API_KEY?.trim() ||
+    process.env.OYY_API_KEY?.trim() ||
+    process.env.WUYIN_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("缺少 GEMINI_API_KEY（也可复用 OYY_API_KEY / WUYIN_API_KEY），请在 .env 中配置");
+  }
+  return apiKey;
+}
+
+function getOpenAIApiKey(): string {
+  const apiKey =
+    process.env.OPENAI_API_KEY?.trim() ||
+    process.env.OYY_API_KEY?.trim() ||
+    process.env.WUYIN_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error("缺少 OPENAI_API_KEY（也可复用 OYY_API_KEY / WUYIN_API_KEY），请在 .env 中配置");
+  }
+  return apiKey;
+}
+
 function readRequiredField(formData: FormData, key: string): string {
   const value = formData.get(key);
   if (typeof value !== "string" || !value.trim()) {
@@ -541,7 +770,7 @@ function readOptionalField(formData: FormData, key: string): string | null {
 }
 
 function toErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "未知错误";
+  return error instanceof Error ? error.message : "閺堫亞鐓￠柨娆掝嚖";
 }
 
 function sleep(ms: number): Promise<void> {
@@ -577,7 +806,7 @@ async function fetchWithSoftTimeout(input: string, init: RequestInit, timeoutMs:
     return await fetch(input, { ...init, signal: timeoutController.signal });
   } catch (error) {
     if (softTimedOut) {
-      throw new Error(`上游请求超时（>${Math.round(timeoutMs / 1000)}秒，软超时）`);
+      throw new Error(`上游请求超时（>${Math.round(timeoutMs / 1000)}秒）`);
     }
     throw error;
   } finally {
@@ -587,9 +816,6 @@ async function fetchWithSoftTimeout(input: string, init: RequestInit, timeoutMs:
     detachExternal?.();
   }
 }
-
-type UploadFieldKey = "sock" | "shoe" | "outfit" | "background";
-type OyyRequestImageField = "image" | "image[]";
 
 function getImageFilesFromFormData(formData: FormData): File[] {
   return collectImageFilesFromFormData(formData);
@@ -626,12 +852,26 @@ function mapAspectRatioToOyySize(aspectRatio: string): string {
   }
 }
 
-function getProvider(): "wuyin" | "oyy" {
+function getProvider(): Provider {
   const provider = process.env.IMAGE_PROVIDER?.trim().toLowerCase();
-  if (provider === "oyy") {
-    return "oyy";
+  if (provider === "banana" || provider === "gemini") {
+    return "banana";
   }
-  return "wuyin";
+  if (provider === "openai") {
+    return "openai";
+  }
+  return "openai";
+}
+
+function resolveProvider(raw: string | null): Provider {
+  const normalized = (raw || "").trim().toLowerCase();
+  if (normalized === "banana" || normalized === "gemini") {
+    return "banana";
+  }
+  if (normalized === "openai") {
+    return "openai";
+  }
+  return getProvider();
 }
 
 function isRetryableOyyStatus(status: number): boolean {
@@ -657,6 +897,66 @@ function normalizeOyyImageApiPath(path: string): string {
   }
   const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
   return withLeadingSlash.replace(/\/+$/, "");
+}
+
+function normalizeApiPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    return "/";
+  }
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+}
+
+function resolveHttpEndpoint(baseUrl: string, apiPath: string): string {
+  const trimmedBase = baseUrl.trim().replace(/\/+$/, "");
+  const normalizedPath = normalizeApiPath(apiPath);
+  if (!trimmedBase) {
+    return normalizedPath;
+  }
+
+  if (/^https?:\/\/[^/]+\/v\d+\/chat\/completions$/i.test(trimmedBase)) {
+    return trimmedBase;
+  }
+
+  try {
+    const parsed = new URL(trimmedBase);
+    const basePath = parsed.pathname.replace(/\/+$/, "");
+    if (basePath && basePath !== "/" && normalizedPath.startsWith(`${basePath}/`)) {
+      return `${parsed.origin}${normalizedPath}`;
+    }
+  } catch {
+    return `${trimmedBase}${normalizedPath}`;
+  }
+
+  return `${trimmedBase}${normalizedPath}`;
+}
+
+function extractImageFromText(text: string): { imageUrl?: string; imageDataUrl?: string } | null {
+  const input = text.trim();
+  if (!input) {
+    return null;
+  }
+
+  const dataUrlMatch = input.match(/(data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=\r\n]+)/i);
+  if (dataUrlMatch?.[1]) {
+    return { imageDataUrl: dataUrlMatch[1].replace(/\s+/g, "") };
+  }
+
+  const markdownImageMatch = input.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+|data:image\/[^\s)]+)\)/i);
+  if (markdownImageMatch?.[1]) {
+    if (markdownImageMatch[1].startsWith("data:image/")) {
+      return { imageDataUrl: markdownImageMatch[1] };
+    }
+    return { imageUrl: markdownImageMatch[1] };
+  }
+
+  const directUrlMatch = input.match(/https?:\/\/[^\s"'<>]+/i);
+  if (directUrlMatch?.[0]) {
+    return { imageUrl: directUrlMatch[0] };
+  }
+
+  return null;
 }
 
 function isModerationBlockedOyyResponse(parsed: ParsedUpstreamResponse<OyyImageResponse>): boolean {
@@ -699,3 +999,6 @@ function buildUpstreamError(
   }
   return pieces.join(" | ");
 }
+
+
+

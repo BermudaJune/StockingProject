@@ -34,6 +34,8 @@ type GeneratePayload = {
   error?: string;
 };
 
+type ModelProvider = "openai" | "banana";
+
 const UPLOAD_SLOTS: Array<Omit<UploadSlot, "file">> = [
   {
     role: "sock",
@@ -63,6 +65,10 @@ const THROTTLE_BETWEEN_IMAGES_MS = 1500;
 const THROTTLE_BETWEEN_GROUPS_MS = 3500;
 const DEFAULT_IMAGE_RETRY_LIMIT = 2;
 const MANUAL_STOP_MESSAGE = "任务已手动停止";
+const MODEL_PROVIDERS: Array<{ value: ModelProvider; label: string }> = [
+  { value: "openai", label: "OpenAI (/v1/chat/completions)" },
+  { value: "banana", label: "Banana (/v1beta/...:generateContent)" }
+];
 const PRODUCT_VIEW_FILE_NAMES = ["product_1.png", "product_2.png", "product_3.png"] as const;
 const RESULT_FILE_NAMES = ["result_A.png", "result_B.png", "result_0.png", "result_1.png", "result_2.png", "result_3.png", "result_4.png", "result_5.png"] as const;
 const ALL_EXPECTED_OUTPUT_FILES = [...PRODUCT_VIEW_FILE_NAMES, ...RESULT_FILE_NAMES];
@@ -268,6 +274,7 @@ export function Workbench({ initialTemplates }: Props) {
   const [isStopRequested, setIsStopRequested] = useState(false);
   const [imageRetryLimit, setImageRetryLimit] = useState<number>(DEFAULT_IMAGE_RETRY_LIMIT);
   const [continueFromExisting, setContinueFromExisting] = useState<boolean>(true);
+  const [modelProvider, setModelProvider] = useState<ModelProvider>("openai");
 
   const activeAbortControllerRef = useRef<AbortController | null>(null);
   const stopRequestedRef = useRef(false);
@@ -392,6 +399,7 @@ export function Workbench({ initialTemplates }: Props) {
                 aspectRatio,
                 outputSize,
                 sock: productFile,
+                modelProvider,
                 skipPromptGuard: true
               }),
             onProgress: (message) => setStatusMessage(`单组第P步 ${viewFileName}：${message}`),
@@ -430,6 +438,7 @@ export function Workbench({ initialTemplates }: Props) {
               shoe: shoeFile,
               outfit: productTwoFile,
               background: productThreeFile,
+              modelProvider,
               skipPromptGuard: true
             }),
           onProgress: (message) => setStatusMessage(`单组第A步：${message}`),
@@ -460,6 +469,7 @@ export function Workbench({ initialTemplates }: Props) {
               outputSize,
               sock: resultAFile,
               outfit: outfitFile,
+              modelProvider,
               skipPromptGuard: true
             }),
           onProgress: (message) => setStatusMessage(`单组第B步：${message}`),
@@ -490,6 +500,7 @@ export function Workbench({ initialTemplates }: Props) {
               outputSize,
               sock: resultBFile,
               background: backgroundFile,
+              modelProvider,
               skipPromptGuard: true
             }),
           onProgress: (message) => setStatusMessage(`单组第C步：${message}`),
@@ -524,6 +535,7 @@ export function Workbench({ initialTemplates }: Props) {
               shoe: productOneFile,
               outfit: productTwoFile,
               background: productThreeFile,
+              modelProvider,
               skipPromptGuard: true
             }),
           onProgress: (message) => setStatusMessage(`单组第D步 result_${variantIndex}：${message}`),
@@ -639,6 +651,7 @@ export function Workbench({ initialTemplates }: Props) {
                     aspectRatio,
                     outputSize,
                     sock: productFile,
+                    modelProvider,
                     skipPromptGuard: true
                   }),
                 onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
@@ -674,6 +687,7 @@ export function Workbench({ initialTemplates }: Props) {
                   shoe: shoeFile,
                   outfit: productTwoFile,
                   background: productThreeFile,
+                  modelProvider,
                   skipPromptGuard: true
                 }),
               onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
@@ -701,6 +715,7 @@ export function Workbench({ initialTemplates }: Props) {
                   outputSize,
                   sock: resultAFile,
                   outfit: outfitFile,
+                  modelProvider,
                   skipPromptGuard: true
                 }),
               onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
@@ -728,6 +743,7 @@ export function Workbench({ initialTemplates }: Props) {
                   outputSize,
                   sock: resultBFile,
                   background: backgroundFile,
+                  modelProvider,
                   skipPromptGuard: true
                 }),
               onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
@@ -760,6 +776,7 @@ export function Workbench({ initialTemplates }: Props) {
                   shoe: productOneFile,
                   outfit: productTwoFile,
                   background: productThreeFile,
+                  modelProvider,
                   skipPromptGuard: true
                 }),
               onProgress: (message) => appendBatchLog(`[${group.name}] ${message}`),
@@ -920,6 +937,14 @@ export function Workbench({ initialTemplates }: Props) {
   return (
     <main className="page-shell">
       <section className="hero">
+        <div className="top-actions">
+          <a className="ghost-button" href="/">
+            返回主页
+          </a>
+          <a className="secondary-button" href="/workflow/txt-batch">
+            去工作流2：4图+prompt.txt
+          </a>
+        </div>
         <div className="muted tiny">当前输出画质：{outputSize}</div>
         <span className="hero-badge">四图主图系统 · 五阶段批处理</span>
         <h1>输入产品/模特/场景，生成展示图</h1>
@@ -950,6 +975,16 @@ export function Workbench({ initialTemplates }: Props) {
               </div>
               <div className="toolbar">
                 <div className="field">
+                  <label htmlFor="modelProvider">模型通道</label>
+                  <select id="modelProvider" value={modelProvider} onChange={(event) => setModelProvider(event.target.value as ModelProvider)}>
+                    {MODEL_PROVIDERS.map((item) => (
+                      <option key={item.value} value={item.value}>
+                        {item.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field">
                   <label htmlFor="imageRetryLimit">单张失败重试次数</label>
                   <input
                     id="imageRetryLimit"
@@ -972,6 +1007,7 @@ export function Workbench({ initialTemplates }: Props) {
               <div className="stack">
                 <div className="note-card tiny">输入目录：{batchInputDirectory ? batchInputDirectory.name : "未选择"}</div>
                 <div className="note-card tiny">输出规则：结果直接写回各子文件夹，命名为 product_1~3、result_A、result_B、result_0、result_1~5</div>
+                <div className="note-card tiny">当前模型通道：{modelProvider}</div>
                 <div className="note-card tiny">背景规则：在 C 步之前（product_1~3、result_A、result_B）必须保持纯白背景；从 C 步开始加入背景。</div>
                 <div className="note-card tiny">当前策略：单张失败最多重试 {imageRetryLimit} 次；{continueFromExisting ? "开启断点续跑" : "关闭断点续跑"}。</div>
               </div>
@@ -1237,12 +1273,16 @@ function buildImageGenerationFormDataByRole(params: {
   shoe?: File;
   outfit?: File;
   background?: File;
+  modelProvider?: ModelProvider;
   skipPromptGuard?: boolean;
 }): FormData {
   const formData = new FormData();
   formData.append("prompt", params.skipPromptGuard ? params.prompt : buildPromptWithProductLock(params.prompt));
   formData.append("aspectRatio", params.aspectRatio);
   formData.append("outputSize", params.outputSize);
+  if (params.modelProvider) {
+    formData.append("modelProvider", params.modelProvider);
+  }
   if (params.sock) {
     formData.append("sock", params.sock);
   }

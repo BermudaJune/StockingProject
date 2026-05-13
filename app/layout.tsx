@@ -4,8 +4,8 @@ import type { Metadata } from "next";
 import "@/app/globals.css";
 
 export const metadata: Metadata = {
-  title: "电商主图工作台",
-  description: "4 图合成主图的本地工作台"
+  title: "Stockings Workflow Studio",
+  description: "两种工作流：分步骤批量与4图+prompt.txt批量直出"
 };
 
 export default function RootLayout({
@@ -19,3 +19,4 @@ export default function RootLayout({
     </html>
   );
 }
+
